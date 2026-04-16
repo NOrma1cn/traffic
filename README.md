@@ -176,15 +176,6 @@ npm run dev
 └─ README.md
 ```
 
-## 上传 GitHub 前建议
-
-上传前建议确认：
-
-1. `git status` 中不包含本地数据目录、`node_modules`、`dist`、日志
-2. `python verify_d03_setup.py` 可正常通过
-3. `.\start_all.ps1` 或 `node dev.js` 可以成功启动
-4. README 描述与当前仓库内容一致
-
 ## 说明
 
 当前 GitHub 版本专注于 **D03 可运行展示主线**。  
