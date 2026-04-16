@@ -1,0 +1,132 @@
+{
+  "dataset": {
+    "name": "Caltrans D03 Sacramento 2023",
+    "region": "Sacramento Metropolitan Area",
+    "district": "D03",
+    "year": 2023,
+    "sensors": 743,
+    "time_range": {
+      "start": "2023-01-01",
+      "end": "2023-12-31"
+    },
+    "temporal_resolution": "5min",
+    "total_timesteps": 105120
+  },
+  "data_paths": {
+    "traffic_dir": "Caltrans_2023_D03/processed_d03_2023_ml95_enriched",
+    "weather_npy": "Caltrans_2023_D03/weather_d03_2023_rich/d03_weather_aligned_to_processed_d03_2023_ml95_2023.npy",
+    "weather_csv": "Caltrans_2023_D03/weather_d03_2023_rich/d03_weather_hourly_mean_2023.csv",
+    "accident_dir": "Caltrans_2023_D03/processed_d03_accident_train_2023"
+  },
+  "model": {
+    "baseline": {
+      "type": "HeteroDiffusionGraphForecaster",
+      "checkpoint": "runs_d03/d03_baseline_pure_st/best.pt",
+      "architecture": {
+        "in_len": 12,
+        "horizon": 12,
+        "gcn_hidden": 64,
+        "gcn_layers": 2,
+        "tf_layers": 2,
+        "d_model": 64,
+        "nhead": 4,
+        "diffusion_steps": 2,
+        "adaptive_rank": 16
+      },
+      "features": {
+        "traffic_core": ["flow", "occupancy", "speed"],
+        "static": true,
+        "weather": false,
+        "accident": false
+      }
+    },
+    "correction": {
+      "type": "WeatherCorrectionNet",
+      "checkpoint": "runs_d03/correction_model/correction_model.pt",
+      "features": {
+        "weather": ["temp", "feelslike", "dew", "humidity", "precip", "windspeed", "winddir", "cloudcover", "visibility", "sealevelpressure"],
+        "accident": true,
+        "static": true
+      }
+    }
+  },
+  "graph": {
+    "mode": "realistic",
+    "directed": false,
+    "corridor_k": 2,
+    "lane_penalty": 0.08,
+    "hop_penalty": 0.35,
+    "opposite_radius_km": 1.0,
+    "opposite_pm_tolerance_mi": 0.6,
+    "same_name_cross_radius_km": 1.2,
+    "junction_radius_km": 0.7,
+    "max_junction_edges": 2
+  },
+  "training": {
+    "split": {
+      "train": 0.7,
+      "val": 0.15,
+      "test": 0.15
+    },
+    "baseline": {
+      "epochs": 50,
+      "batch_size": 4,
+      "lr": 0.001,
+      "predict_delta": true
+    },
+    "correction": {
+      "epochs": 15,
+      "batch_size": 8,
+      "lr": 0.001,
+      "event_oversampling": true
+    }
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8010,
+    "device": "cuda",
+    "start_index": 288,
+    "tick_seconds": 10,
+    "mode": "multitask_occ_primary_weather_attn"
+  },
+  "frontend": {
+    "api_base": "http://127.0.0.1:8010",
+    "poll_ms": 3000,
+    "default_sensor": 42,
+    "visualization": {
+      "sphere_nations": 12,
+      "sphere_radius": 2.0,
+      "camera_distance_min": 3.8,
+      "camera_distance_max": 9.0
+    }
+  },
+  "metadata": {
+    "center_lat": 38.58,
+    "center_lon": -121.49,
+    "bbox": {
+      "min_lat": 38.0,
+      "max_lat": 39.0,
+      "min_lon": -122.0,
+      "max_lon": -121.0
+    },
+    "major_freeways": ["I-5", "I-80", "US-50", "SR-99"],
+    "coverage": {
+      "mainline": true,
+      "hov": true,
+      "onramp": true,
+      "offramp": true
+    }
+  },
+  "performance": {
+    "baseline_mae": {
+      "speed_kmh": 8.5,
+      "occupancy": 0.08,
+      "flow_veh_5min": 15.2
+    },
+    "correction_improvement": {
+      "weather_events": "15-25% MAE reduction",
+      "accident_scenarios": "20-30% MAE reduction",
+      "clear_conditions": "baseline parity"
+    }
+  }
+}

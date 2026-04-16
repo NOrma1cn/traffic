@@ -1,0 +1,78 @@
+# ------------------------------------------------------------
+# OS / editor
+# ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ------------------------------------------------------------
+# Node / frontend
+# ------------------------------------------------------------
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ------------------------------------------------------------
+# Logs / temp
+# ------------------------------------------------------------
+logs/
+*.log
+tmp/
+temp/
+
+# ------------------------------------------------------------
+# Local datasets and large artifacts
+# The repo now keeps only the runtime-required processed datasets locally.
+# They are still ignored to keep the GitHub repo lightweight.
+# ------------------------------------------------------------
+Caltrans_2023_D03/
+
+# Keep only the minimal checkpoints needed for demo / local inference
+runs_d03/*
+!runs_d03/d03_baseline_pure_st/
+runs_d03/d03_baseline_pure_st/*
+!runs_d03/d03_baseline_pure_st/best.pt
+!runs_d03/correction_model/
+runs_d03/correction_model/*
+!runs_d03/correction_model/correction_model.pt
+
+# ------------------------------------------------------------
+# Generated analysis outputs
+# ------------------------------------------------------------
+highway_d03_overpass.json
+latest_model_eval_d03.json
+latest_model_eval_d03.png
+defense_analysis_d03.json
+defense_analysis_d03.png
+defense_analysis_d03_sensors.png
+DEFENSE_ANALYSIS_D03.md

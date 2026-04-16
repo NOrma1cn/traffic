@@ -1,0 +1,99 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&family=Orbitron:wght@400;700;900&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+.font-technical {
+  font-family: 'Orbitron', sans-serif;
+}
+
+body {
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar for dark theme */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0A0A0B;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272A;
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3F3F46;
+}
+
+/* Rain Shader Keyframes */
+@keyframes rain-fall-fast {
+  0% { background-position: 0px 0px; }
+  100% { background-position: 100px 1000px; }
+}
+
+@keyframes rain-fall-medium {
+  0% { background-position: 0px 0px; }
+  100% { background-position: 80px 800px; }
+}
+
+@keyframes rain-fall-slow {
+  0% { background-position: 0px 0px; }
+  100% { background-position: 50px 500px; }
+}
+
+.animate-rain-fast {
+  animation: rain-fall-fast 0.6s linear infinite;
+}
+
+.animate-rain-medium {
+  animation: rain-fall-medium 1.2s linear infinite;
+}
+
+.animate-rain-slow {
+  animation: rain-fall-slow 2.5s linear infinite;
+}
+
+/* Death Stranding - Chiral Weather Overlay */
+@keyframes ds-digital-rain {
+  0% { transform: translateY(-30%); opacity: 0; }
+  20% { opacity: 0.15; }
+  80% { opacity: 0.15; }
+  100% { transform: translateY(30%); opacity: 0; }
+}
+
+@keyframes ds-fog-drift {
+  0% { transform: translateX(-15%); opacity: 0.1; }
+  50% { transform: translateX(5%); opacity: 0.25; }
+  100% { transform: translateX(15%); opacity: 0.1; }
+}
+
+.bg-ds-rain-lines {
+  background-image: repeating-linear-gradient(180deg, transparent 0, transparent 40px, rgba(200, 220, 255, 0.05) 40px, rgba(200, 220, 255, 0.15) 80px, transparent 80px);
+  background-size: 8px 160px;
+  animation: ds-digital-rain 1.2s linear infinite;
+  opacity: 0.3;
+}
+
+.bg-ds-fog-blob {
+  background: radial-gradient(ellipse at 50% 50%, rgba(130, 150, 170, 0.15) 0%, transparent 70%);
+  animation: ds-fog-drift 15s ease-in-out infinite alternate;
+  filter: blur(50px);
+}
+@keyframes pulse-slow {
+  0% { opacity: 0.6; transform: scale(0.98); }
+  50% { opacity: 1; transform: scale(1.02); }
+  100% { opacity: 0.6; transform: scale(0.98); }
+}
+
+.animate-pulse-slow {
+  animation: pulse-slow 4s ease-in-out infinite;
+}
