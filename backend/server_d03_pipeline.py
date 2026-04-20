@@ -182,6 +182,29 @@ def select_weather_fields(
     )
 
 
+def parse_t_obs_query(value) -> int | None:
+    parsed = _maybe_int(value)
+    if parsed is None:
+        return None
+    return int(parsed)
+
+
+def parse_weather_override_query(qs: dict[str, list[str]]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key, values in qs.items():
+        if not str(key).startswith("wx_"):
+            continue
+        field = str(key)[3:].strip()
+        if not field:
+            continue
+        raw = values[0] if values else None
+        val = _maybe_float(raw)
+        if val is None:
+            continue
+        out[field] = float(val)
+    return out
+
+
 class CaltransTrafficService:
     def __init__(
         self,
@@ -495,6 +518,95 @@ class CaltransTrafficService:
     def _future_indices(self, t_obs: int, steps: int | None = None) -> np.ndarray:
         use_steps = self.out_horizon if steps is None else int(steps)
         return self._circular_indices(t_obs + 1, use_steps)
+
+    def _resolve_t_obs(self, t_obs_override: int | None) -> int:
+        if t_obs_override is None:
+            return self._now_index()
+        return int(t_obs_override) % self.t_len
+
+    def _weather_preset_override(self, preset: str, *, t_obs: int) -> dict[str, float] | None:
+        name = str(preset or "").strip().lower()
+        if not name:
+            return None
+        row = self.weather_raw[int(t_obs) % self.t_len]
+
+        def wx(field: str, default: float) -> float:
+            return float(self._weather_value(row, field, default))
+
+        temp = wx("temp", 60.0)
+        humidity = wx("humidity", 50.0)
+        precip = wx("precip", 0.0)
+        windspeed = wx("windspeed", 8.0)
+        cloudcover = wx("cloudcover", 30.0)
+        visibility = wx("visibility", 10.0)
+
+        if name in {"clear", "sunny"}:
+            return {
+                "precip": 0.0,
+                "cloudcover": max(5.0, min(cloudcover, 18.0)),
+                "humidity": max(20.0, min(humidity, 45.0)),
+                "windspeed": max(2.0, min(windspeed, 10.0)),
+                "visibility": max(10.0, visibility),
+            }
+        if name in {"cloudy", "overcast"}:
+            return {
+                "precip": min(0.03, precip),
+                "cloudcover": max(80.0, cloudcover),
+                "humidity": max(55.0, humidity),
+                "windspeed": max(4.0, windspeed),
+                "visibility": max(6.0, min(visibility, 10.0)),
+            }
+        if name in {"rain", "rainy"}:
+            return {
+                "precip": max(0.08, precip),
+                "cloudcover": max(88.0, cloudcover),
+                "humidity": max(80.0, humidity),
+                "windspeed": max(10.0, windspeed),
+                "visibility": max(1.5, min(visibility, 5.0)),
+            }
+        if name in {"storm", "heavy_rain"}:
+            return {
+                "precip": max(0.18, precip),
+                "cloudcover": max(95.0, cloudcover),
+                "humidity": max(88.0, humidity),
+                "windspeed": max(22.0, windspeed),
+                "visibility": max(0.8, min(visibility, 2.5)),
+            }
+        if name in {"fog", "foggy"}:
+            return {
+                "precip": min(0.02, precip),
+                "cloudcover": max(70.0, cloudcover),
+                "humidity": max(95.0, humidity),
+                "windspeed": min(6.0, windspeed),
+                "visibility": max(0.3, min(visibility, 1.5)),
+            }
+        if name in {"windy"}:
+            return {
+                "precip": min(0.02, precip),
+                "cloudcover": max(40.0, min(cloudcover, 75.0)),
+                "humidity": max(35.0, min(humidity, 70.0)),
+                "windspeed": max(28.0, windspeed),
+                "visibility": max(8.0, visibility),
+            }
+        if name in {"heat"}:
+            return {
+                "temp": max(temp, 95.0),
+                "precip": 0.0,
+                "cloudcover": max(5.0, min(cloudcover, 25.0)),
+                "humidity": max(18.0, min(humidity, 35.0)),
+                "windspeed": max(2.0, min(windspeed, 10.0)),
+                "visibility": max(10.0, visibility),
+            }
+        if name in {"cold"}:
+            return {
+                "temp": min(temp, 36.0),
+                "precip": min(0.03, precip),
+                "cloudcover": max(45.0, cloudcover),
+                "humidity": max(55.0, humidity),
+                "windspeed": max(5.0, windspeed),
+                "visibility": max(7.0, visibility),
+            }
+        return None
 
     def _weather_field_map(self, row: np.ndarray, *, n: int = 4) -> dict[str, float | None]:
         out: dict[str, float | None] = {}
@@ -1029,6 +1141,61 @@ class CaltransTrafficService:
         # Return [B, N, H, 3]
         return pred_raw.transpose(0, 2, 1, 3)
 
+    def _apply_weather_override_effect(
+        self,
+        pred: np.ndarray,
+        *,
+        t_obs: int,
+        weather_override: dict[str, float] | None,
+    ) -> np.ndarray:
+        if not weather_override:
+            return pred
+        future_idx = self._future_indices(t_obs)
+        wx_future = self.weather_raw[future_idx]
+
+        def wx_mean(field: str, default: float) -> float:
+            if field not in self.weather_field_names:
+                return float(default)
+            col = self.weather_field_names.index(field)
+            arr = wx_future[:, col]
+            if not np.isfinite(arr).any():
+                return float(default)
+            return float(np.nanmean(arr))
+
+        baseline_temp = wx_mean("temp", 60.0)
+        baseline_humidity = wx_mean("humidity", 50.0)
+        baseline_precip = wx_mean("precip", 0.0)
+        baseline_wind = wx_mean("windspeed", 8.0)
+        baseline_cloud = wx_mean("cloudcover", 30.0)
+        baseline_visibility = wx_mean("visibility", 10.0)
+
+        temp = float(weather_override.get("temp", baseline_temp))
+        humidity = float(weather_override.get("humidity", baseline_humidity))
+        precip = float(weather_override.get("precip", baseline_precip))
+        wind = float(weather_override.get("windspeed", baseline_wind))
+        cloud = float(weather_override.get("cloudcover", baseline_cloud))
+        visibility = float(weather_override.get("visibility", baseline_visibility))
+
+        rain_term = max(0.0, (precip - baseline_precip) / 0.12) - max(0.0, (baseline_precip - precip) / 0.08)
+        hum_term = max(0.0, (humidity - baseline_humidity) / 25.0) - max(0.0, (baseline_humidity - humidity) / 22.0)
+        cloud_term = max(0.0, (cloud - baseline_cloud) / 35.0) - max(0.0, (baseline_cloud - cloud) / 30.0)
+        wind_term = max(0.0, (wind - baseline_wind) / 18.0) - max(0.0, (baseline_wind - wind) / 14.0)
+        vis_term = max(0.0, (baseline_visibility - visibility) / 4.0) - max(0.0, (visibility - baseline_visibility) / 5.0)
+        temp_term = max(0.0, abs(temp - baseline_temp) / 30.0)
+
+        stress = 0.38 * rain_term + 0.18 * hum_term + 0.16 * cloud_term + 0.18 * wind_term + 0.22 * vis_term + 0.08 * temp_term
+        stress = float(np.clip(stress, -1.2, 2.2))
+
+        speed_scale = float(np.clip(1.0 - 0.12 * stress, 0.72, 1.16))
+        occ_scale = float(np.clip(1.0 + 0.16 * stress, 0.75, 1.45))
+        flow_scale = float(np.clip(1.0 - 0.08 * stress, 0.78, 1.2))
+
+        out = pred.copy()
+        out[:, :, 0] = np.maximum(out[:, :, 0] * flow_scale, 0.0)
+        out[:, :, 1] = np.maximum(out[:, :, 1] * occ_scale, 0.0)
+        out[:, :, 2] = np.maximum(out[:, :, 2] * speed_scale, 0.0)
+        return out
+
     def _day_type_index(self, idx: int) -> int:
         return 0 if int(self.timestamps[int(idx) % self.t_len].dayofweek) < 5 else 1
 
@@ -1414,18 +1581,29 @@ class CaltransTrafficService:
             },
         }
 
-    def forecast(self, *, sensor: int) -> dict:
+    def forecast(
+        self,
+        *,
+        sensor: int,
+        t_obs_override: int | None = None,
+        weather_override: dict[str, float] | None = None,
+    ) -> dict:
         if not (0 <= sensor < self.n_nodes):
             raise ValueError(f"sensor must be in [0, {self.n_nodes - 1}]")
 
-        t_obs = self._now_index()
+        t_obs = self._resolve_t_obs(t_obs_override)
+        base_weather_override = dict(weather_override) if weather_override else None
         # 1. Collect all scenario specifications
         weather_transition = self._detect_weather_transition(t_obs)
-        weather_specs = self._get_weather_scenario_specs(weather_transition, t_obs) if weather_transition["active"] else []
+        weather_specs = (
+            self._get_weather_scenario_specs(weather_transition, t_obs)
+            if weather_transition["active"] and not base_weather_override
+            else []
+        )
         accident_specs = self._get_accident_scenario_specs(t_obs, sensor)
         
         # 2. Prepare batch: [Main, WeatherScenarios..., AccidentScenarios...]
-        w_ovs = [None] + [s["override"] for s in weather_specs] + [None] * len(accident_specs)
+        w_ovs = [base_weather_override] + [s["override"] for s in weather_specs] + [None] * len(accident_specs)
         a_ovs = [None] + [None] * len(weather_specs) + [s["override"] for s in accident_specs]
         
         # 3. RUN BATCH INFERENCE
@@ -1440,6 +1618,11 @@ class CaltransTrafficService:
         print(f"[server] Batch inference complete. Result shape: {batch_preds.shape}")
         
         pred = batch_preds[0] # Main prediction [N, H, 3]
+        pred = self._apply_weather_override_effect(
+            pred,
+            t_obs=t_obs,
+            weather_override=base_weather_override,
+        )
 
         pred_flow = pred[:, :, 0].transpose(1, 0)
         pred_occ = pred[:, :, 1].transpose(1, 0)
@@ -1656,6 +1839,7 @@ class CaltransTrafficService:
                 "dataset": "Caltrans D03 2023",
                 "mode": "multitask_occ_primary_weather_attn",
                 "t_obs": int(t_obs),
+                "t_obs_source": "override" if t_obs_override is not None else "clock",
                 "sensor": int(sensor),
                 "n_sensors": int(self.n_nodes),
                 "in_len": int(self.in_len),
@@ -1664,6 +1848,8 @@ class CaltransTrafficService:
                 "sim_time": self.timestamps[int(t_obs)].isoformat(),
                 "day_type": "weekday" if self._day_type_index(t_obs) == 0 else "weekend",
                 "slot_index": int(self._slot_index(t_obs)),
+                "counterfactual_weather": bool(base_weather_override),
+                "weather_override_fields": sorted(list((base_weather_override or {}).keys())),
             },
             "dataset_context": self._dataset_context_packet(),
             "station": station_packet,
@@ -1817,7 +2003,24 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/forecast":
                 q = parse_qs(u.query)
                 sensor = int(q.get("sensor", ["0"])[0])
-                self._send_json(200, self.service.forecast(sensor=sensor))
+                t_obs = parse_t_obs_query(q.get("t_obs", [None])[0])
+                weather_override = parse_weather_override_query(q)
+                weather_preset = str(q.get("weather_preset", [""])[0]).strip()
+                if weather_preset:
+                    preset_override = self.service._weather_preset_override(
+                        weather_preset,
+                        t_obs=self.service._resolve_t_obs(t_obs),
+                    )
+                    if preset_override:
+                        weather_override = {**preset_override, **weather_override}
+                self._send_json(
+                    200,
+                    self.service.forecast(
+                        sensor=sensor,
+                        t_obs_override=t_obs,
+                        weather_override=weather_override or None,
+                    ),
+                )
                 return
             self._send_json(404, {"error": "not_found", "path": u.path})
         except Exception as e:

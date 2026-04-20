@@ -29,11 +29,18 @@ interface NetworkSphereModalProps {
   graphData: { nodes: any[]; links: any[]; metadata?: any } | null;
   globalLevels: number[];
   selectedSensor: number;
+  highlightedSensor?: number | null;
   viewMode?: PanoramaMode;
   // Weather can now be an array of 12 distinct months from the backend
   weather?: WeatherData | WeatherData[] | null;
   // Spacetime mode: month for each nation (12 nations, 1-12)
   spacetimeMonths?: number[];
+  sensorCount?: number;
+  currentTimeIndex?: number;
+  maxTimeIndex?: number;
+  previewSensor?: number | null;
+  previewTimeIndex?: number | null;
+  onPreviewChange?: (sensorId: number, timeIndex: number) => void;
 }
 
 export interface RegionNation {
@@ -53,6 +60,77 @@ const MIN_CAMERA_DISTANCE = 3.8;
 const MAX_CAMERA_DISTANCE = 9.0;
 const MIN_ROTATE_SPEED = 0.9;
 const MAX_ROTATE_SPEED = 4.0;
+const TIME_WIDGET_RADIUS = 60;
+const DAY_WIDGET_ITEM_HEIGHT = 30;
+const DAY_WIDGET_VIEWPORT_HEIGHT = 120;
+const DAY_WIDGET_CENTER_PADDING = (DAY_WIDGET_VIEWPORT_HEIGHT - DAY_WIDGET_ITEM_HEIGHT) / 2;
+const DAY_WIDGET_SCROLL_ANIMATION_MS = 220;
+const DAY_WIDGET_WHEEL_COOLDOWN_MS = 140;
+const SENSOR_WIDGET_MIN_WIDTH = 56;
+const SENSOR_WIDGET_MAX_WIDTH = 320;
+const SENSOR_WIDGET_ANIMATION_MS = 500;
+const SENSOR_HANDLE_WIDTH = 28;
+const DAYS_IN_MONTH_2023 = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const MONTH_MAPPING = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+const FINAL_ANGLES = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180];
+const COLLAPSED_ANGLES = Array.from({ length: 12 }, (_, i) => -45 + i * (90 / 11));
+
+function clampMonth(month: number) {
+  const m = Math.floor(month);
+  return Math.max(1, Math.min(12, m));
+}
+
+function clampDay(month: number, day: number) {
+  const m = clampMonth(month);
+  const max = DAYS_IN_MONTH_2023[m - 1] ?? 31;
+  return Math.max(1, Math.min(max, Math.floor(day)));
+}
+
+function tObsToMonthDay(tObs: number): { month: number; day: number } {
+  const dayOfYear = Math.max(0, Math.floor(tObs / 288));
+  let remain = dayOfYear;
+  for (let m = 1; m <= 12; m++) {
+    const len = DAYS_IN_MONTH_2023[m - 1];
+    if (remain < len) return { month: m, day: remain + 1 };
+    remain -= len;
+  }
+  return { month: 12, day: 31 };
+}
+
+function monthDayToTObs(month: number, day: number, slot: number, maxTimeIndex: number): number {
+  const m = clampMonth(month);
+  const d = clampDay(m, day);
+  const dayBefore = DAYS_IN_MONTH_2023.slice(0, m - 1).reduce((acc, v) => acc + v, 0);
+  const dayOfYear = dayBefore + (d - 1);
+  const s = Math.max(0, Math.min(287, Math.floor(slot)));
+  const idx = dayOfYear * 288 + s;
+  return Math.max(0, Math.min(Math.max(0, maxTimeIndex), idx));
+}
+
+function clampSensorId(sensorId: number, sensorCount: number): number {
+  const safeCount = Math.max(1, Math.floor(sensorCount));
+  return Math.max(1, Math.min(safeCount, Math.round(sensorId)));
+}
+
+function sensorIdToWidth(sensorId: number, sensorCount: number): number {
+  const safeCount = Math.max(1, Math.floor(sensorCount));
+  if (safeCount <= 1) return SENSOR_WIDGET_MIN_WIDTH;
+  const clamped = clampSensorId(sensorId, safeCount);
+  const ratio = (clamped - 1) / (safeCount - 1);
+  return SENSOR_WIDGET_MIN_WIDTH + ratio * (SENSOR_WIDGET_MAX_WIDTH - SENSOR_WIDGET_MIN_WIDTH);
+}
+
+function widthToSensorId(width: number, sensorCount: number): number {
+  const safeCount = Math.max(1, Math.floor(sensorCount));
+  if (safeCount <= 1) return 1;
+  const clampedWidth = Math.max(SENSOR_WIDGET_MIN_WIDTH, Math.min(SENSOR_WIDGET_MAX_WIDTH, width));
+  const ratio = (clampedWidth - SENSOR_WIDGET_MIN_WIDTH) / (SENSOR_WIDGET_MAX_WIDTH - SENSOR_WIDGET_MIN_WIDTH);
+  return clampSensorId(1 + ratio * (safeCount - 1), safeCount);
+}
+
+function easeOutQuart(x: number): number {
+  return 1 - Math.pow(1 - x, 4);
+}
 
 /* ─────────────────── Helpers ─────────────────── */
 
@@ -354,6 +432,7 @@ function buildScene(
   cellPolygons: THREE.Vector3[][],
   latestProps: React.MutableRefObject<{
     selectedSensor: number;
+    highlightedSensor: number | null;
     globalLevels: number[];
     weathersData: WeatherData[];
     viewMode: PanoramaMode;
@@ -395,7 +474,12 @@ function buildScene(
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(45, canvas.clientWidth / canvas.clientHeight, 0.1, 50);
-  orientCameraToSensor(camera, sensorPositions, latestProps.current.selectedSensor, 6.5);
+  orientCameraToSensor(
+    camera,
+    sensorPositions,
+    latestProps.current.highlightedSensor ?? latestProps.current.selectedSensor,
+    6.5,
+  );
   
   console.log('[buildScene] Camera positioned:', {
     position: camera.position.toArray(),
@@ -643,6 +727,21 @@ function buildScene(
   nodeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   scene.add(nodeMesh);
 
+  // Dedicated hollow square mesh for the currently highlighted (previewing) sensor
+  const focusSquareGeo = new THREE.RingGeometry(0.82, 1.0, 4);
+  focusSquareGeo.rotateZ(Math.PI / 4); // Rotate diamond into a square
+  const focusSquareMat = new THREE.MeshBasicMaterial({
+    color: 0x00ffff,
+    transparent: true,
+    opacity: 0.95,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    depthTest: true,
+  });
+  const focusSquareMesh = new THREE.Mesh(focusSquareGeo, focusSquareMat);
+  focusSquareMesh.visible = false;
+  scene.add(focusSquareMesh);
+
   // Distribute specific location matrices
   const dummy = new THREE.Object3D();
   const nodeCurrentColors = Array.from({ length: sensorCount }, () => new THREE.Color(0x000000));
@@ -659,8 +758,10 @@ function buildScene(
   let hoveredNation = -1;
   let hoveredSensor = -1;
   let activeSelectedSensor = latestProps.current.selectedSensor;
+  let activeHighlightedSensor = latestProps.current.highlightedSensor ?? -1;
+  let activeFocusSensor = latestProps.current.highlightedSensor ?? latestProps.current.selectedSensor;
   let activeViewMode = latestProps.current.viewMode;
-  let pulseOriginSensor = latestProps.current.selectedSensor;
+  let pulseOriginSensor = activeFocusSensor;
   let pulseElapsed = 0;
   // 加快脉冲速度
   let pulseTravelDuration = 1.2;
@@ -762,17 +863,22 @@ function buildScene(
   };
 
   const updateNodes = () => {
-    const { selectedSensor, globalLevels } = latestProps.current;
+    const { selectedSensor, highlightedSensor, globalLevels } = latestProps.current;
 
     for (let i = 0; i < sensorCount; i++) {
         const nationId = sensorToNation[i];
         const isInHoveredNation = nationId !== -1 && nationId === hoveredNation;
         const isHoveredNode = i === hoveredSensor;
         const isTargeted = i === selectedSensor;
+        const isHighlighted = highlightedSensor === i;
 
         // Node specific congestion color
         const level = globalLevels[i] ?? 0;
-        if (isTargeted) {
+        if (isHighlighted && !isTargeted) {
+            // Hide instanced node ring when using the dedicated square focus mesh
+            nodeTargetScales[i] = 0.0001;
+            nodeTargetColors[i].copy(levelToNodeColor(level));
+        } else if (isTargeted) {
             nodeTargetScales[i] = 0.07;
             nodeTargetColors[i].set(0x00ffff);
         } else if (isHoveredNode) {
@@ -788,7 +894,7 @@ function buildScene(
     }
   };
   updateNodes(); // initial
-  setPulseOrigin(activeSelectedSensor);
+  setPulseOrigin(activeFocusSensor);
   pulseElapsed = 0; // 从0开始，让脉冲可见
   syncNationOverlayMix();
 
@@ -828,7 +934,12 @@ function buildScene(
           // PRECISION FIX: Check if the click point is actually near the node centroid
           const distToNode = hits[0].point.distanceTo(sensorPositions[sensorIdx]);
           if (distToNode < 0.15) {
-              onSelectSensor(sensorIdx);
+              const highlighted = latestProps.current.highlightedSensor;
+              if (highlighted === null || highlighted === undefined || highlighted < 0) {
+                onSelectSensor(sensorIdx);
+              } else if (sensorIdx === highlighted) {
+                onSelectSensor(sensorIdx);
+              }
           }
       }
     }
@@ -964,10 +1075,21 @@ function buildScene(
         }
     }
     
-    const { selectedSensor, viewMode } = latestProps.current;
+    const { selectedSensor, highlightedSensor, viewMode } = latestProps.current;
+    const normalizedHighlighted = highlightedSensor ?? -1;
+    const focusSensor = highlightedSensor ?? selectedSensor;
     const sensorChanged = selectedSensor !== activeSelectedSensor;
+    const highlightedChanged = normalizedHighlighted !== activeHighlightedSensor;
+    const focusChanged = focusSensor !== activeFocusSensor;
     const modeChanged = viewMode !== activeViewMode;
-    if (newHoverNation !== hoveredNation || newHoveredSensor !== hoveredSensor || sensorChanged || modeChanged) {
+    if (
+      newHoverNation !== hoveredNation ||
+      newHoveredSensor !== hoveredSensor ||
+      sensorChanged ||
+      highlightedChanged ||
+      focusChanged ||
+      modeChanged
+    ) {
         hoveredNation = newHoverNation;
         hoveredSensor = newHoveredSensor;
         updateNodes();
@@ -977,18 +1099,24 @@ function buildScene(
           
           if (timeSinceLastSwitch < minSwitchInterval && congestionTransitionActive) {
             // 快速连续切换：使用智能反转
-            startCongestionTransition(selectedSensor, viewMode);
+            startCongestionTransition(focusSensor, viewMode);
           } else {
             // 正常切换
-            startCongestionTransition(selectedSensor, viewMode);
-            resetPulse(selectedSensor);
+            startCongestionTransition(focusSensor, viewMode);
+            resetPulse(focusSensor);
           }
           
           lastModeSwitchTime = elapsed;
-        } else if (sensorChanged && activeViewMode === 'weather' && !congestionTransitionActive && congestionTransitionTarget === 0) {
-          resetPulse(selectedSensor);
+        } else if ((sensorChanged || highlightedChanged || focusChanged) && activeViewMode === 'weather' && !congestionTransitionActive && congestionTransitionTarget === 0) {
+          resetPulse(focusSensor);
+        }
+        if (focusChanged) {
+          orientCameraToSensor(camera, sensorPositions, focusSensor, camera.position.length());
+          controls.update();
         }
         activeSelectedSensor = selectedSensor;
+        activeHighlightedSensor = normalizedHighlighted;
+        activeFocusSensor = focusSensor;
         activeViewMode = viewMode;
     }
 
@@ -1108,12 +1236,15 @@ function buildScene(
        nodeCurrentScales[i] = THREE.MathUtils.lerp(nodeCurrentScales[i], nodeTargetScales[i], 0.16);
        nodeCurrentColors[i].lerp(nodeTargetColors[i], 0.16);
 
+       const isHighlighted = i === (latestProps.current.highlightedSensor ?? -1);
        const isTargeted = i === latestProps.current.selectedSensor;
        const isHoveredNode = i === hoveredSensor;
-       const pulse = isTargeted
-         ? 1.0 + Math.sin(elapsed * 4.5) * 0.08
-         : isHoveredNode
-           ? 1.0 + Math.sin(elapsed * 7.0) * 0.06
+       const pulse = isHighlighted
+         ? 1.0 + Math.sin(elapsed * 5.2) * 0.12
+         : isTargeted
+          ? 1.0 + Math.sin(elapsed * 4.5) * 0.08
+          : isHoveredNode
+            ? 1.0 + Math.sin(elapsed * 7.0) * 0.06
            : 1.0;
 
        dummy.position.copy(p).addScaledVector(nodeNormal, 0.006);
@@ -1126,6 +1257,24 @@ function buildScene(
     }
     nodeMesh.instanceMatrix.needsUpdate = true;
     if (nodeMesh.instanceColor) nodeMesh.instanceColor.needsUpdate = true;
+
+    // ── Update Dedicated Square Highlight Mesh ──
+    const activeHighlightIdx = latestProps.current.highlightedSensor ?? -1;
+    if (activeHighlightIdx !== -1 && activeHighlightIdx !== selectedSensor && activeHighlightIdx < sensorPositions.length) {
+      const p = sensorPositions[activeHighlightIdx];
+      const norm = p.clone().normalize();
+      focusSquareMesh.position.copy(p).addScaledVector(norm, 0.012);
+      focusSquareMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), norm);
+      // Static scale (no breathing) matching the user's preference for consistency
+      const level = latestProps.current.globalLevels[activeHighlightIdx] ?? 0;
+      if (focusSquareMesh.material instanceof THREE.MeshBasicMaterial) {
+        focusSquareMesh.material.color.copy(levelToNodeColor(level));
+      }
+      focusSquareMesh.scale.setScalar(0.12);
+      focusSquareMesh.visible = true;
+    } else {
+      focusSquareMesh.visible = false;
+    }
 
     // ── Update 3D Floating Weather Plane Decals ──
     for (const wi of weatherIcons) {
@@ -1259,9 +1408,16 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   graphData,
   globalLevels,
   selectedSensor,
+  highlightedSensor = null,
   viewMode = 'weather',
   weather,
   spacetimeMonths,
+  sensorCount = 743,
+  currentTimeIndex = 0,
+  maxTimeIndex = 105119,
+  previewSensor = null,
+  previewTimeIndex = null,
+  onPreviewChange,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
@@ -1276,6 +1432,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   // Pass dynamic values through a mutable Ref to completely prevent expensive recreating of Three geometries & resetting OrbitCamera!
   const latestProps = useRef({
     selectedSensor,
+    highlightedSensor,
     globalLevels,
     weathersData: weatherArr,
     viewMode,
@@ -1285,14 +1442,369 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   useEffect(() => {
     latestProps.current = { 
       selectedSensor, 
+      highlightedSensor,
       globalLevels, 
       weathersData: weatherArr, 
       viewMode,
       spacetimeMonths: spacetimeMonths || Array.from({ length: 12 }, (_, i) => i + 1),
     };
-  }, [selectedSensor, globalLevels, weatherArr, viewMode, spacetimeMonths]);
+  }, [selectedSensor, highlightedSensor, globalLevels, weatherArr, viewMode, spacetimeMonths]);
 
   const [zoomLevel, setZoomLevel] = useState(0); // 0 (far) to 1 (near)
+  const safeSensorCount = Math.max(1, Math.floor(sensorCount));
+  const effectivePreviewSensor = previewSensor ?? highlightedSensor ?? selectedSensor;
+  const effectivePreviewTime = previewTimeIndex ?? currentTimeIndex;
+  const [timeExpanded, setTimeExpanded] = useState(false);
+  const [timeTargetExpanded, setTimeTargetExpanded] = useState(false);
+  const [timeAnimating, setTimeAnimating] = useState(false);
+  const [dotProgress, setDotProgress] = useState<number[]>(() => Array(12).fill(0));
+  const [widgetSensorId, setWidgetSensorId] = useState(() =>
+    clampSensorId(effectivePreviewSensor + 1, safeSensorCount),
+  );
+  const [isSensorInputOpen, setIsSensorInputOpen] = useState(false);
+  const [sensorInputValue, setSensorInputValue] = useState(() =>
+    String(clampSensorId(effectivePreviewSensor + 1, safeSensorCount)),
+  );
+  const [sensorSliderWidth, setSensorSliderWidth] = useState(() =>
+    sensorIdToWidth(effectivePreviewSensor + 1, safeSensorCount),
+  );
+  const [widgetMonth, setWidgetMonth] = useState(() => tObsToMonthDay(effectivePreviewTime).month);
+  const [widgetDay, setWidgetDay] = useState(() => tObsToMonthDay(effectivePreviewTime).day);
+  const sensorInputRef = useRef<HTMLInputElement>(null);
+  const sensorSliderRef = useRef<HTMLDivElement>(null);
+  const sensorFillRef = useRef<HTMLDivElement>(null);
+  const dateScrollRef = useRef<HTMLDivElement>(null);
+  const lastCommittedPreviewRef = useRef<{ sensor: number; tObs: number } | null>(null);
+  const previewCommitTimerRef = useRef<number | null>(null);
+  const isProgrammaticScrollRef = useRef(false);
+  const programmaticScrollTimerRef = useRef<number | null>(null);
+  const wheelCooldownUntilRef = useRef(0);
+  const sensorDragActiveRef = useRef(false);
+  const sensorDragStartXRef = useRef(0);
+  const sensorDragStartWidthRef = useRef(sensorIdToWidth(effectivePreviewSensor + 1, safeSensorCount));
+  const sensorSliderWidthRef = useRef(sensorIdToWidth(effectivePreviewSensor + 1, safeSensorCount));
+  const sensorAnimationFrameRef = useRef<number | null>(null);
+
+  const applySensorWidth = (newWidth: number) => {
+    const clampedWidth = Math.max(SENSOR_WIDGET_MIN_WIDTH, Math.min(SENSOR_WIDGET_MAX_WIDTH, newWidth));
+    sensorSliderWidthRef.current = clampedWidth;
+    setSensorSliderWidth((prev) => (Math.abs(prev - clampedWidth) < 0.1 ? prev : clampedWidth));
+    const nextSensorId = widthToSensorId(clampedWidth, safeSensorCount);
+    setWidgetSensorId((prev) => (prev === nextSensorId ? prev : nextSensorId));
+  };
+
+  const stopSensorAnimation = () => {
+    if (sensorAnimationFrameRef.current !== null) {
+      cancelAnimationFrame(sensorAnimationFrameRef.current);
+      sensorAnimationFrameRef.current = null;
+    }
+  };
+
+  const beginSensorDrag = (clientX: number, startWidth: number) => {
+    stopSensorAnimation();
+    sensorDragActiveRef.current = true;
+    sensorDragStartXRef.current = clientX;
+    sensorDragStartWidthRef.current = startWidth;
+  };
+
+  const animateSensorWidth = (targetWidth: number, duration = SENSOR_WIDGET_ANIMATION_MS) => {
+    const clampedTarget = Math.max(SENSOR_WIDGET_MIN_WIDTH, Math.min(SENSOR_WIDGET_MAX_WIDTH, targetWidth));
+    stopSensorAnimation();
+
+    const startWidth = sensorSliderWidthRef.current;
+    const distance = clampedTarget - startWidth;
+    let startTime: number | null = null;
+
+    const step = (timestamp: number) => {
+      if (startTime === null) startTime = timestamp;
+      const progress = Math.min((timestamp - startTime) / Math.max(1, duration), 1);
+      const nextWidth = startWidth + distance * easeOutQuart(progress);
+      applySensorWidth(nextWidth);
+
+      if (progress < 1) {
+        sensorAnimationFrameRef.current = requestAnimationFrame(step);
+      } else {
+        sensorAnimationFrameRef.current = null;
+        applySensorWidth(clampedTarget);
+      }
+    };
+
+    sensorAnimationFrameRef.current = requestAnimationFrame(step);
+  };
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const nextSensorId = clampSensorId(effectivePreviewSensor + 1, safeSensorCount);
+    const nextWidth = sensorIdToWidth(nextSensorId, safeSensorCount);
+    setWidgetSensorId((prev) => (prev === nextSensorId ? prev : nextSensorId));
+    if (!sensorDragActiveRef.current) {
+      sensorSliderWidthRef.current = nextWidth;
+      setSensorSliderWidth((prev) => (Math.abs(prev - nextWidth) < 0.1 ? prev : nextWidth));
+    }
+    if (!isSensorInputOpen) {
+      setSensorInputValue(String(nextSensorId));
+    }
+    const md = tObsToMonthDay(effectivePreviewTime);
+    setWidgetMonth((prev) => (prev === md.month ? prev : md.month));
+    setWidgetDay((prev) => (prev === md.day ? prev : md.day));
+  }, [isOpen, effectivePreviewSensor, effectivePreviewTime, safeSensorCount, isSensorInputOpen]);
+
+  useEffect(() => {
+    if (isOpen) return;
+    lastCommittedPreviewRef.current = null;
+    setTimeTargetExpanded(false);
+    setIsSensorInputOpen(false);
+    wheelCooldownUntilRef.current = 0;
+    sensorDragActiveRef.current = false;
+    stopSensorAnimation();
+    if (previewCommitTimerRef.current !== null) {
+      window.clearTimeout(previewCommitTimerRef.current);
+      previewCommitTimerRef.current = null;
+    }
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+      programmaticScrollTimerRef.current = null;
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isSensorInputOpen || !sensorInputRef.current) return;
+    sensorInputRef.current.focus();
+    sensorInputRef.current.select();
+  }, [isSensorInputOpen]);
+
+  useEffect(() => {
+    if (!isOpen || !dateScrollRef.current) return;
+    const sc = dateScrollRef.current;
+    const day = clampDay(widgetMonth, widgetDay);
+    isProgrammaticScrollRef.current = true;
+    sc.scrollTo({ top: (day - 1) * DAY_WIDGET_ITEM_HEIGHT, behavior: 'smooth' });
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+    }
+    programmaticScrollTimerRef.current = window.setTimeout(() => {
+      isProgrammaticScrollRef.current = false;
+      programmaticScrollTimerRef.current = null;
+    }, DAY_WIDGET_SCROLL_ANIMATION_MS);
+  }, [isOpen, widgetMonth, effectivePreviewTime]);
+
+  useEffect(() => {
+    const onMouseMove = (event: MouseEvent) => {
+      if (!sensorDragActiveRef.current) return;
+      const deltaX = event.clientX - sensorDragStartXRef.current;
+      applySensorWidth(sensorDragStartWidthRef.current + deltaX);
+    };
+
+    const onMouseUp = () => {
+      if (!sensorDragActiveRef.current) return;
+      sensorDragActiveRef.current = false;
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, [safeSensorCount]);
+
+  useEffect(() => {
+    if (!isOpen || !dateScrollRef.current) return;
+    const sc = dateScrollRef.current;
+
+    const onWheel = (event: WheelEvent) => {
+      if (timeExpanded || timeAnimating) return;
+
+      event.preventDefault();
+      const deltaY = Number(event.deltaY);
+      if (!Number.isFinite(deltaY) || Math.abs(deltaY) < 0.01) return;
+
+      const now = performance.now();
+      if (now < wheelCooldownUntilRef.current) return;
+      wheelCooldownUntilRef.current = now + DAY_WIDGET_WHEEL_COOLDOWN_MS;
+
+      const direction = Math.sign(deltaY);
+      if (direction === 0) return;
+
+      setWidgetDay((prev) => {
+        const nextDay = clampDay(widgetMonth, prev + direction);
+        if (nextDay !== prev) {
+          isProgrammaticScrollRef.current = true;
+          sc.scrollTo({ top: (nextDay - 1) * DAY_WIDGET_ITEM_HEIGHT, behavior: 'smooth' });
+          if (programmaticScrollTimerRef.current !== null) {
+            window.clearTimeout(programmaticScrollTimerRef.current);
+          }
+          programmaticScrollTimerRef.current = window.setTimeout(() => {
+            isProgrammaticScrollRef.current = false;
+            programmaticScrollTimerRef.current = null;
+          }, DAY_WIDGET_SCROLL_ANIMATION_MS);
+        }
+        return nextDay;
+      });
+    };
+
+    sc.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      sc.removeEventListener('wheel', onWheel);
+    };
+  }, [isOpen, timeExpanded, timeAnimating, widgetMonth]);
+
+  useEffect(() => {
+    if (!isOpen || !dateScrollRef.current) return;
+    const sc = dateScrollRef.current;
+    const update = (skipStateCommit = false) => {
+      const items = sc.querySelectorAll<HTMLElement>('[data-day-item="1"]');
+      if (!items.length) return;
+      const containerCenter = sc.scrollTop + sc.clientHeight / 2;
+      let nearestDay = 1;
+      let nearestDist = Number.POSITIVE_INFINITY;
+      items.forEach((item) => {
+        const day = Number(item.dataset.dayValue ?? 0);
+        const itemCenter = item.offsetTop + item.offsetHeight / 2;
+        const dist = Math.abs(containerCenter - itemCenter);
+        if (dist < nearestDist) {
+          nearestDist = dist;
+          nearestDay = day;
+        }
+        const maxDist = 45;
+        const ratio = Math.max(0, 1 - dist / maxDist);
+        const scale = 0.5 + 0.5 * ratio;
+        let xOffset = 0;
+        if (dist < TIME_WIDGET_RADIUS) {
+          xOffset = TIME_WIDGET_RADIUS - Math.sqrt(TIME_WIDGET_RADIUS * TIME_WIDGET_RADIUS - dist * dist);
+        } else {
+          xOffset = TIME_WIDGET_RADIUS;
+        }
+        item.style.opacity = String(ratio);
+        item.style.transform = `translateX(-${xOffset}px) scale(${scale})`;
+      });
+      if (skipStateCommit) return;
+      const clamped = clampDay(widgetMonth, nearestDay);
+      setWidgetDay((prev) => (prev === clamped ? prev : clamped));
+    };
+
+    let raf = 0;
+    const onScroll = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => update(isProgrammaticScrollRef.current));
+    };
+    sc.addEventListener('scroll', onScroll, { passive: true });
+    update();
+    return () => {
+      cancelAnimationFrame(raf);
+      if (programmaticScrollTimerRef.current !== null) {
+        window.clearTimeout(programmaticScrollTimerRef.current);
+        programmaticScrollTimerRef.current = null;
+      }
+      sc.removeEventListener('scroll', onScroll);
+    };
+  }, [isOpen, widgetMonth]);
+
+  useEffect(() => {
+    if (!isOpen || !onPreviewChange) return;
+    const slot = Math.max(0, Math.min(287, effectivePreviewTime % 288));
+    const tObs = monthDayToTObs(widgetMonth, widgetDay, slot, maxTimeIndex);
+    const previewSensorIdx = clampSensorId(widgetSensorId, safeSensorCount) - 1;
+    const prev = lastCommittedPreviewRef.current;
+    if (prev && prev.sensor === previewSensorIdx && prev.tObs === tObs) return;
+    if (previewCommitTimerRef.current !== null) {
+      window.clearTimeout(previewCommitTimerRef.current);
+      previewCommitTimerRef.current = null;
+    }
+    previewCommitTimerRef.current = window.setTimeout(() => {
+      lastCommittedPreviewRef.current = { sensor: previewSensorIdx, tObs };
+      onPreviewChange(previewSensorIdx, tObs);
+      previewCommitTimerRef.current = null;
+    }, 160);
+    return () => {
+      if (previewCommitTimerRef.current !== null) {
+        window.clearTimeout(previewCommitTimerRef.current);
+        previewCommitTimerRef.current = null;
+      }
+    };
+  }, [isOpen, onPreviewChange, widgetSensorId, effectivePreviewTime, widgetMonth, widgetDay, maxTimeIndex, safeSensorCount]);
+
+  const toggleTimeAnimation = (toExpand: boolean, selectedMonth?: number) => {
+    if (timeAnimating) return;
+    if (selectedMonth !== undefined && selectedMonth !== null) {
+      const m = clampMonth(selectedMonth);
+      setWidgetMonth(m);
+      setWidgetDay((prev) => clampDay(m, prev));
+    }
+    setTimeTargetExpanded(toExpand);
+    setTimeAnimating(true);
+    const duration = 1200;
+    const stagger = 150;
+    const startTimes = new Array(12).fill(0);
+    if (toExpand) {
+      for (let i = 0; i < 6; i++) {
+        startTimes[i] = i * stagger;
+        startTimes[11 - i] = i * stagger;
+      }
+    } else {
+      for (let i = 0; i < 6; i++) {
+        startTimes[i] = (5 - i) * stagger;
+        startTimes[11 - i] = (5 - i) * stagger;
+      }
+    }
+
+    let start: number | null = null;
+    const step = (ts: number) => {
+      if (start === null) start = ts;
+      const elapsed = ts - start;
+      let allDone = true;
+      const next = new Array(12).fill(0).map((_, i) => {
+        const dotElapsed = elapsed - startTimes[i];
+        let progress = 0;
+        if (dotElapsed > 0) progress = Math.min(dotElapsed / duration, 1);
+        if (progress < 1) allDone = false;
+        const eased = 1 - Math.pow(1 - progress, 5);
+        return toExpand ? eased : 1 - eased;
+      });
+      setDotProgress(next);
+      if (!allDone) {
+        requestAnimationFrame(step);
+      } else {
+        setTimeAnimating(false);
+        setTimeExpanded(toExpand);
+      }
+    };
+    requestAnimationFrame(step);
+  };
+
+  const shouldHideDateWidget = timeExpanded || (timeAnimating && timeTargetExpanded);
+  const commitSensorInput = (rawValue?: string) => {
+    const parsed = Number.parseInt(String(rawValue ?? sensorInputValue).trim(), 10);
+    const nextSensorId = clampSensorId(Number.isFinite(parsed) ? parsed : widgetSensorId, safeSensorCount);
+    setWidgetSensorId(nextSensorId);
+    setSensorInputValue(String(nextSensorId));
+    animateSensorWidth(sensorIdToWidth(nextSensorId, safeSensorCount));
+    setIsSensorInputOpen(false);
+  };
+
+  const cancelSensorInput = () => {
+    setSensorInputValue(String(widgetSensorId));
+    setIsSensorInputOpen(false);
+  };
+
+  const handleSensorHandleMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+    beginSensorDrag(event.clientX, sensorSliderWidthRef.current);
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  const handleSensorContainerMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+    const rect = sensorSliderRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const nextWidth = event.clientX - rect.left;
+    animateSensorWidth(nextWidth);
+    event.preventDefault();
+  };
+
+  const handleSensorFieldMouseDown = (event: React.MouseEvent<HTMLButtonElement | HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+  };
 
   /* Build exactly 12 Nations mapping using bottom up Edge Stitching */
   const { nations, sensorPositions, borderEdges, cellPolygons } = useMemo(() => {
@@ -1442,6 +1954,182 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
             className="absolute inset-0 w-full h-full cursor-crosshair z-[5]"
             onContextMenu={handleContextMenu}
           />
+
+          <div className="absolute right-6 bottom-6 z-[28] pointer-events-auto flex items-center gap-8">
+            <div
+              ref={sensorSliderRef}
+              onMouseDown={handleSensorContainerMouseDown}
+              className="relative h-10 w-[320px] cursor-pointer select-none"
+              style={{ userSelect: 'none', WebkitUserSelect: 'none' }}
+            >
+              {isSensorInputOpen ? (
+                <div
+                  onMouseDown={handleSensorFieldMouseDown}
+                  className="absolute left-[-104px] top-1/2 z-[3] flex h-11 w-[92px] -translate-y-1/2 flex-col justify-center rounded-[8px] border border-white/15 bg-white/5 px-3 backdrop-blur-sm"
+                >
+                  <div className="mb-0.5 text-[9px] font-bold tracking-[0.18em] text-white/45">
+                    SENSOR
+                  </div>
+                  <input
+                    ref={sensorInputRef}
+                    value={sensorInputValue}
+                    inputMode="numeric"
+                    onChange={(event) => {
+                      const nextValue = event.target.value.replace(/[^\d]/g, '');
+                      setSensorInputValue(nextValue);
+                    }}
+                    onBlur={() => commitSensorInput()}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        commitSensorInput();
+                      } else if (event.key === 'Escape') {
+                        event.preventDefault();
+                        cancelSensorInput();
+                      }
+                    }}
+                    className="w-full border-none bg-transparent p-0 text-[15px] font-bold text-white outline-none"
+                    style={{ fontVariantNumeric: 'tabular-nums' }}
+                    aria-label="Sensor ID"
+                  />
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onMouseDown={handleSensorFieldMouseDown}
+                  onClick={() => setIsSensorInputOpen(true)}
+                  className="absolute left-[-104px] top-1/2 z-[3] flex h-11 w-[92px] -translate-y-1/2 flex-col items-start justify-center rounded-[8px] border border-white/10 bg-white/[0.03] px-3 text-left transition-colors duration-200 hover:border-white/20 hover:bg-white/[0.06]"
+                >
+                  <span className="text-[9px] font-bold tracking-[0.18em] text-white/45">
+                    SENSOR
+                  </span>
+                  <span
+                    className="text-[14px] font-bold text-white/85"
+                    style={{ fontVariantNumeric: 'tabular-nums' }}
+                  >
+                    {widgetSensorId}
+                  </span>
+                </button>
+              )}
+              <div className="absolute left-0 top-1/2 h-[2px] w-full -translate-y-1/2 rounded-[2px] bg-white/15" />
+              <div
+                ref={sensorFillRef}
+                className="absolute left-0 top-1/2 z-[2] flex h-8 -translate-y-1/2 cursor-pointer items-center justify-end rounded-[4px] bg-white pr-[38px] box-border transition-shadow duration-200 hover:shadow-[0_0_10px_rgba(255,255,255,0.2)]"
+                style={{ width: `${sensorSliderWidth}px` }}
+              >
+                <span
+                  className="pointer-events-none text-[15px] font-bold text-black"
+                  style={{ fontVariantNumeric: 'tabular-nums' }}
+                >
+                  {widgetSensorId}
+                </span>
+                <div
+                  onMouseDown={handleSensorHandleMouseDown}
+                  className="absolute right-0 top-0 flex h-full w-7 cursor-ew-resize items-center justify-center"
+                  aria-label="Drag sensor selector"
+                >
+                  <div className="h-4 w-[2px] rounded-full bg-black/45" />
+                </div>
+              </div>
+            </div>
+
+            <div className="relative w-[200px] h-[200px] flex items-center justify-center">
+              <svg className="absolute top-0 left-0 z-[1] pointer-events-none" width="200" height="200">
+                <defs>
+                  <filter id="goo-time-widget" colorInterpolationFilters="sRGB">
+                    <feGaussianBlur in="SourceGraphic" stdDeviation="4" result="blur" />
+                    <feColorMatrix
+                      in="blur"
+                      mode="matrix"
+                      values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 19 -9"
+                      result="goo"
+                    />
+                  </filter>
+                </defs>
+                <g filter="url(#goo-time-widget)" fill="#ffffff">
+                  {MONTH_MAPPING.map((m, i) => {
+                    const p = dotProgress[i] ?? 0;
+                    const angleDeg = COLLAPSED_ANGLES[i] + (FINAL_ANGLES[i] - COLLAPSED_ANGLES[i]) * p;
+                    const rad = angleDeg * Math.PI / 180;
+                    const cx = 100 + TIME_WIDGET_RADIUS * Math.cos(rad);
+                    const cy = 100 + TIME_WIDGET_RADIUS * Math.sin(rad);
+                    return <circle key={`tw-dot-${m}`} cx={cx} cy={cy} r={12} />;
+                  })}
+                </g>
+              </svg>
+
+              <div className="absolute top-0 left-0 w-[200px] h-[200px] z-[5] pointer-events-none">
+                {MONTH_MAPPING.map((m, i) => {
+                  const p = dotProgress[i] ?? 0;
+                  const angleDeg = COLLAPSED_ANGLES[i] + (FINAL_ANGLES[i] - COLLAPSED_ANGLES[i]) * p;
+                  const rad = angleDeg * Math.PI / 180;
+                  const x = 100 + TIME_WIDGET_RADIUS * Math.cos(rad);
+                  const y = 100 + TIME_WIDGET_RADIUS * Math.sin(rad);
+                  const op = Math.max(0, Math.min(1, (p - 0.7) / 0.3));
+                  return (
+                    <button
+                      key={`tw-label-${m}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (timeExpanded && !timeAnimating) toggleTimeAnimation(false, m);
+                      }}
+                      className="absolute w-[30px] h-[30px] flex items-center justify-center text-[13px] font-bold text-black transition-transform transition-colors duration-200 hover:scale-125 hover:text-blue-500"
+                      style={{
+                        left: `${x}px`,
+                        top: `${y}px`,
+                        transform: 'translate(-50%, -50%)',
+                        opacity: op,
+                        pointerEvents: timeExpanded && !timeAnimating ? 'auto' : 'none',
+                      }}
+                    >
+                      {m}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <button
+                className="relative z-[4] w-[60px] h-[60px] rounded-full bg-white text-black text-2xl font-bold select-none active:scale-90 transition-transform duration-200"
+                onClick={() => toggleTimeAnimation(!timeExpanded)}
+              >
+                {widgetMonth}
+              </button>
+
+              <div
+                ref={dateScrollRef}
+                className="absolute z-[3] w-[40px] h-[120px] overflow-y-scroll cursor-grab"
+                style={{
+                  left: '160px',
+                  top: '100px',
+                  transform: 'translate(-50%, -50%)',
+                  scrollbarWidth: 'none',
+                  msOverflowStyle: 'none',
+                  scrollSnapType: 'y mandatory',
+                  scrollBehavior: 'smooth',
+                  scrollPaddingTop: DAY_WIDGET_CENTER_PADDING,
+                  scrollPaddingBottom: DAY_WIDGET_CENTER_PADDING,
+                  WebkitOverflowScrolling: 'touch',
+                  opacity: shouldHideDateWidget ? 0 : 1,
+                  pointerEvents: shouldHideDateWidget || timeAnimating ? 'none' : 'auto',
+                  transition: 'opacity 0.4s ease',
+                }}
+              >
+                <div style={{ height: DAY_WIDGET_CENTER_PADDING, flexShrink: 0 }} />
+                {Array.from({ length: 31 }, (_, idx) => idx + 1).map((d) => (
+                  <div
+                    key={`tw-day-${d}`}
+                    data-day-item="1"
+                    data-day-value={d}
+                    className="flex items-center justify-center text-black text-[18px] font-bold"
+                    style={{ height: DAY_WIDGET_ITEM_HEIGHT, scrollSnapAlign: 'center', scrollSnapStop: 'always' }}
+                  >
+                    {d}
+                  </div>
+                ))}
+                <div style={{ height: DAY_WIDGET_CENTER_PADDING, flexShrink: 0 }} />
+              </div>
+            </div>
+          </div>
 
           <ModeSwitchOverlay mode={viewMode} zoom={zoomLevel} />
         </motion.div>

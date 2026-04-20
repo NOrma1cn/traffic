@@ -1,5 +1,5 @@
 import React, { useLayoutEffect, useRef, useState, useMemo } from 'react';
-import { motion, useAnimation } from 'framer-motion';
+import { motion } from 'framer-motion';
 
 export interface FlowNode {
   id: string;
@@ -30,6 +30,7 @@ interface SankeyFlowChartProps {
   hideTitle?: boolean;
   compact?: boolean;
   background?: boolean;
+  onCenterClick?: () => void;
 }
 
 const SankeyFlowChart: React.FC<SankeyFlowChartProps> = ({
@@ -41,6 +42,7 @@ const SankeyFlowChart: React.FC<SankeyFlowChartProps> = ({
   hideTitle = false,
   compact = false,
   background = true,
+  onCenterClick,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
@@ -48,11 +50,13 @@ const SankeyFlowChart: React.FC<SankeyFlowChartProps> = ({
   const centerRRef = useRef<HTMLDivElement>(null);
   const leftAnchorRefs = useRef<{ [key: string]: HTMLDivElement | null }>({});
   const rightAnchorRefs = useRef<{ [key: string]: HTMLDivElement | null }>({});
+  const pathsHashRef = useRef('');
+  const gradientsHashRef = useRef('');
+  const calcScheduledRef = useRef(false);
 
   const [paths, setPaths] = useState<{ full: string; collapsed: string }[]>([]);
   const [gradientIds, setGradientIds] = useState<{ id: string; node: FlowNode; side: 'L' | 'R' }[]>([]);
   const [isHovered, setIsHovered] = useState(false);
-  const [isReady, setIsReady] = useState(false);
 
   const calculatePaths = () => {
     if (!containerRef.current || !svgRef.current || !centerLRef.current || !centerRRef.current) return;
@@ -154,20 +158,38 @@ const SankeyFlowChart: React.FC<SankeyFlowChartProps> = ({
       currentCenterYRight += scaledThickness;
     });
 
-    setPaths(newPaths);
-    setGradientIds(newGradients);
-    setIsReady(true);
+    const nextPathsHash = newPaths.map((p) => `${p.full}|${p.collapsed}`).join('||');
+    if (nextPathsHash !== pathsHashRef.current) {
+      pathsHashRef.current = nextPathsHash;
+      setPaths(newPaths);
+    }
+
+    const nextGradientsHash = newGradients
+      .map((g) => `${g.id}|${g.side}|${g.node.gradient.from}|${g.node.gradient.to}|${g.node.gradient.fromOpacity ?? ''}|${g.node.gradient.toOpacity ?? ''}`)
+      .join('||');
+    if (nextGradientsHash !== gradientsHashRef.current) {
+      gradientsHashRef.current = nextGradientsHash;
+      setGradientIds(newGradients);
+    }
   };
 
   useLayoutEffect(() => {
     if (!containerRef.current) return;
     const observer = new ResizeObserver(() => {
-      requestAnimationFrame(calculatePaths);
+      if (calcScheduledRef.current) return;
+      calcScheduledRef.current = true;
+      requestAnimationFrame(() => {
+        calcScheduledRef.current = false;
+        calculatePaths();
+      });
     });
     observer.observe(containerRef.current);
     calculatePaths();
-    return () => observer.disconnect();
-  }, [leftNodes, rightNodes, height, compact, isHovered]);
+    return () => {
+      calcScheduledRef.current = false;
+      observer.disconnect();
+    };
+  }, [leftNodes, rightNodes, height, compact]);
 
   return (
     <div 
@@ -278,7 +300,10 @@ const SankeyFlowChart: React.FC<SankeyFlowChartProps> = ({
           initial={{ scale: 0.8 }}
           animate={{ scale: isHovered ? 1 : 0.9 }}
           transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
-          className={`${background ? 'bg-[#0B0D14]/80 shadow-[0_0_40px_rgba(0,0,0,0.5)]' : 'bg-transparent'} absolute inset-0 overflow-hidden backdrop-blur-md rounded-full flex items-center justify-center`}
+          className={`${background ? 'bg-[#0B0D14]/80 shadow-[0_0_40px_rgba(0,0,0,0.5)]' : 'bg-transparent'} absolute inset-0 overflow-hidden backdrop-blur-md rounded-full flex items-center justify-center ${onCenterClick ? 'cursor-pointer' : ''}`}
+          onClick={onCenterClick}
+          role={onCenterClick ? 'button' : undefined}
+          aria-label={onCenterClick ? 'Open weather scenario panel' : undefined}
         >
           {centerNode.icon ? (
             <div

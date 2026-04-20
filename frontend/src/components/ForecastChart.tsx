@@ -29,6 +29,8 @@ interface ForecastChartProps {
   compact?: boolean;
   simTime?: string;
   forcedMax?: number;
+  branchPredicted?: number[];
+  branchLabel?: string;
 }
 
 type ViewMode = 'timeline' | 'weekly';
@@ -64,6 +66,8 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
   compact = false,
   simTime,
   forcedMax,
+  branchPredicted,
+  branchLabel,
 }) => {
   const [viewMode, setViewMode] = useState<ViewMode>('timeline');
   const [internalHoveredPoint, setInternalHoveredPoint] = useState<any>(null);
@@ -158,12 +162,22 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
     return { observed, predicted };
   }, [data, predictionStartIdx]);
 
+  const branchSeries = useMemo(() => {
+    if (!branchPredicted || branchPredicted.length === 0 || chartData.predicted.length === 0) return [];
+    const anchor = chartData.observed[chartData.observed.length - 1]?.y ?? chartData.predicted[0]?.y ?? 0;
+    return chartData.predicted.map((p, i) => ({
+      x: p.x,
+      y: i === 0 ? anchor : (branchPredicted[i - 1] ?? p.y),
+      time: p.time,
+    }));
+  }, [branchPredicted, chartData]);
+
   const weeklySeries = useMemo(() => (multiDayData ?? []).filter(d => d.data.length > 0), [multiDayData]);
 
   // --- 缩放与布局逻辑 ---
   const { minVal, maxVal, range, width, height, padding } = useMemo(() => {
     const allY = viewMode === 'timeline'
-      ? [...chartData.observed, ...chartData.predicted].map(p => p.y)
+      ? [...chartData.observed, ...chartData.predicted, ...branchSeries].map(p => p.y)
       : weeklySeries.flatMap(d => d.data);
 
     const rawMin = Math.min(...allY, referenceValue ?? Infinity);
@@ -182,13 +196,14 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
       height: 400,
       padding: { top: 60, bottom: 60, left: 80, right: 80 },
     };
-  }, [chartData, weeklySeries, viewMode, referenceValue, forcedMax]);
+  }, [chartData, weeklySeries, viewMode, referenceValue, forcedMax, branchSeries]);
 
   const getY = (val: number) => height - padding.bottom - ((val - minVal) / range) * (height - padding.top - padding.bottom);
   const getX = (idx: number, total: number) => padding.left + (idx / Math.max(total - 1, 1)) * (width - padding.left - padding.right);
 
   const observedPathPoints = chartData.observed.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
   const predictedPathPoints = chartData.predicted.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
+  const branchPathPoints = branchSeries.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
 
   const timelineVisible = viewMode === 'timeline';
 
@@ -227,6 +242,11 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
               </div>
             )}
             <span className="text-[9px] font-bold tracking-wider text-zinc-400 uppercase">{metricLabel} ({unit})</span>
+            {branchPathPoints.length > 1 && timelineVisible && (
+              <span className="text-[8px] font-bold tracking-wider text-cyan-300 uppercase">
+                {branchLabel ?? '分支预测'}
+              </span>
+            )}
           </div>
           <h2 className={`${compact ? 'text-sm' : 'text-xl'} font-black tracking-tight text-white uppercase italic`}>
             {compact ? metricLabel : (
@@ -348,6 +368,19 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
                   transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
                   fill="none" stroke="#10b981" strokeWidth="2.5" strokeDasharray="8 6" strokeLinecap="round" opacity="0.8" 
                 />
+                {branchPathPoints.length > 1 && (
+                  <motion.path
+                    initial={{ d: getSmoothPath(branchPathPoints) }}
+                    animate={{ d: getSmoothPath(branchPathPoints) }}
+                    transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+                    fill="none"
+                    stroke="#f97316"
+                    strokeWidth="2.5"
+                    strokeDasharray="3 5"
+                    strokeLinecap="round"
+                    opacity="0.95"
+                  />
+                )}
 
                 {/* 每一个数据点的“非线性”运动动画 */}
                 {observedPathPoints.map((p, i) => (

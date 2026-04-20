@@ -40,6 +40,19 @@ const DESIRED_MODE = 'multitask_occ_primary_weather_attn';
 const normalizeBase = (base: string) => String(base ?? '').replace(/\/+$/, '');
 const apiUrlWithBase = (base: string, path: string) => `${normalizeBase(base)}${path.startsWith('/') ? path : `/${path}`}`;
 const sleep = (ms: number) => new Promise((r) => window.setTimeout(r, ms));
+const KMH_PER_MPH = 1.60934;
+const MM_PER_INCH = 25.4;
+
+type WeatherMode = 'preset' | 'custom';
+type WeatherPresetKey = 'clear' | 'cloudy' | 'rain' | 'storm' | 'fog' | 'windy' | 'heat' | 'cold';
+type WeatherOverride = Partial<{
+  temp: number;
+  humidity: number;
+  precip: number;
+  windspeed: number;
+  cloudcover: number;
+  visibility: number;
+}>;
 
 type MetricKey = 'risk' | 'speed' | 'occupancy' | 'flow';
 
@@ -94,6 +107,11 @@ type ApiResponse = {
     out_horizon: number;
     tick_seconds: number;
     sim_time: string;
+    t_obs_source?: 'clock' | 'override';
+    counterfactual_weather?: boolean;
+  };
+  dataset_context?: {
+    time_steps?: number;
   };
   station: {
     id: string;
@@ -209,6 +227,17 @@ type ApiResponse = {
   };
 };
 
+const WEATHER_PRESETS: Array<{ key: WeatherPresetKey; label: string; desc: string }> = [
+  { key: 'clear', label: '晴朗', desc: '低湿度、低云量、高能见度' },
+  { key: 'cloudy', label: '阴天', desc: '高云量、轻微扰动' },
+  { key: 'rain', label: '降雨', desc: '中雨工况，能见度下降' },
+  { key: 'storm', label: '暴雨', desc: '强降雨+大风，极端天气' },
+  { key: 'fog', label: '大雾', desc: '高湿低能见度' },
+  { key: 'windy', label: '强风', desc: '高风速，降雨较低' },
+  { key: 'heat', label: '高温', desc: '高温晴热天气' },
+  { key: 'cold', label: '低温', desc: '低温阴冷天气' },
+];
+
 type HealthResponse = {
   ok: boolean;
   status?: {
@@ -266,17 +295,118 @@ const App: React.FC = () => {
   const [panoramaMode, setPanoramaMode] = useState<PanoramaMode>('weather');
   const [graphData, setGraphData] = useState<{ nodes: any[]; links: any[] } | null>(null);
   const [selectedMetric, setSelectedMetric] = useState<MetricKey>('risk');
+  const [weatherPanelOpen, setWeatherPanelOpen] = useState<boolean>(false);
+  const [weatherMode, setWeatherMode] = useState<WeatherMode>('preset');
+  const [weatherPreset, setWeatherPreset] = useState<WeatherPresetKey>('rain');
+  const [weatherCustom, setWeatherCustom] = useState({
+    temp_c: 18,
+    humidity: 70,
+    precip_mm: 1.5,
+    wind_kmh: 18,
+    cloudcover: 70,
+    visibility_km: 6.0,
+  });
+  const [weatherOverrideEnabled, setWeatherOverrideEnabled] = useState<boolean>(false);
+  const [customApi, setCustomApi] = useState<ApiResponse | null>(null);
+  const [customApiError, setCustomApiError] = useState<string | null>(null);
+  const [spherePreview, setSpherePreview] = useState<{ sensor: number; tObs: number } | null>(null);
+  const [spherePreviewApi, setSpherePreviewApi] = useState<ApiResponse | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const customAbortRef = useRef<AbortController | null>(null);
+  const spherePreviewAbortRef = useRef<AbortController | null>(null);
   const loadingRef = useRef<boolean>(false);
   const spacetimeMonths = useMemo(() => Array.from({ length: 12 }, (_, i) => i + 1), []);
+  const toBackendWeatherOverride = (ui: {
+    temp_c: number;
+    humidity: number;
+    precip_mm: number;
+    wind_kmh: number;
+    cloudcover: number;
+    visibility_km: number;
+  }): WeatherOverride => ({
+    temp: ui.temp_c * 9.0 / 5.0 + 32.0,
+    humidity: ui.humidity,
+    precip: ui.precip_mm / MM_PER_INCH,
+    windspeed: ui.wind_kmh / KMH_PER_MPH,
+    cloudcover: ui.cloudcover,
+    visibility: ui.visibility_km / KMH_PER_MPH,
+  });
 
+  const buildPresetOverride = (preset: WeatherPresetKey, cw: WeatherPacket): WeatherOverride => {
+    const baseline = toBackendWeatherOverride({
+      temp_c: cw.temp_c,
+      humidity: cw.humidity,
+      precip_mm: cw.precip_mm,
+      wind_kmh: cw.wind_kmh,
+      cloudcover: cw.cloudcover,
+      visibility_km: cw.visibility_km,
+    });
+    switch (preset) {
+      case 'clear':
+        return { ...baseline, precip: 0, cloudcover: 12, humidity: 35, windspeed: 5, visibility: 10 };
+      case 'cloudy':
+        return { ...baseline, precip: 0.01, cloudcover: 90, humidity: 65, windspeed: 8, visibility: 7 };
+      case 'rain':
+        return { ...baseline, precip: 0.10, cloudcover: 94, humidity: 86, windspeed: 12, visibility: 3.2 };
+      case 'storm':
+        return { ...baseline, precip: 0.22, cloudcover: 98, humidity: 94, windspeed: 26, visibility: 1.4 };
+      case 'fog':
+        return { ...baseline, precip: 0.01, cloudcover: 72, humidity: 97, windspeed: 4, visibility: 0.8 };
+      case 'windy':
+        return { ...baseline, precip: 0.0, cloudcover: 55, humidity: 52, windspeed: 30, visibility: 9 };
+      case 'heat':
+        return { ...baseline, temp: 102, precip: 0.0, cloudcover: 18, humidity: 28, windspeed: 6, visibility: 10 };
+      case 'cold':
+        return { ...baseline, temp: 35, precip: 0.01, cloudcover: 66, humidity: 62, windspeed: 9, visibility: 8 };
+      default:
+        return baseline;
+    }
+  };
 
+  const activeWeatherOverride = useMemo<WeatherOverride | null>(() => {
+    if (!weatherOverrideEnabled || !api?.current_weather) return null;
+    if (weatherMode === 'custom') return toBackendWeatherOverride(weatherCustom);
+    return buildPresetOverride(weatherPreset, api.current_weather);
+  }, [weatherOverrideEnabled, weatherMode, weatherCustom, weatherPreset, api?.current_weather]);
+
+  const buildForecastUrl = (
+    base: string,
+    sensorId: number,
+    opts?: { tObs?: number; weatherOverride?: WeatherOverride },
+  ) => {
+    const query = new URLSearchParams();
+    query.set('sensor', String(sensorId));
+    if (opts?.tObs !== undefined && opts?.tObs !== null && Number.isFinite(opts.tObs)) {
+      query.set('t_obs', String(Math.floor(opts.tObs)));
+    }
+    if (opts?.weatherOverride) {
+      Object.entries(opts.weatherOverride).forEach(([k, v]) => {
+        if (v === undefined || v === null || !Number.isFinite(v)) return;
+        query.set(`wx_${k}`, String(v));
+      });
+    }
+    return apiUrlWithBase(base, `/api/forecast?${query.toString()}`);
+  };
+
+  const fetchForecastRequest = async (
+    sensorId: number,
+    base: string,
+    opts?: { tObs?: number; weatherOverride?: WeatherOverride; signal?: AbortSignal },
+  ): Promise<ApiResponse> => {
+    const res = await fetch(buildForecastUrl(base, sensorId, opts), { signal: opts?.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const j = await res.json();
+    if (!isValidApiResponse(j)) {
+      throw new Error('Connected backend is not the new Caltrans multitask API');
+    }
+    return j;
+  };
 
   const fetchForecastOnce = async (
     s?: number,
     base?: string,
-    opts?: { abortPrev?: boolean },
+    opts?: { abortPrev?: boolean; tObs?: number; weatherOverride?: WeatherOverride },
   ): Promise<ApiResponse | null> => {
     const abortPrev = opts?.abortPrev !== false;
     if (!abortPrev && loadingRef.current) return null;
@@ -288,12 +418,11 @@ const App: React.FC = () => {
     setApiError(null);
     try {
       const ss = s ?? sensor;
-      const res = await fetch(apiUrlWithBase(base ?? apiBase, `/api/forecast?sensor=${ss}`), { signal: ctrl.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const j = await res.json();
-      if (!isValidApiResponse(j)) {
-        throw new Error('Connected backend is not the new Caltrans multitask API');
-      }
+      const j = await fetchForecastRequest(ss, base ?? apiBase, {
+        tObs: opts?.tObs,
+        weatherOverride: opts?.weatherOverride,
+        signal: ctrl.signal,
+      });
       setApi(j);
       if (j.meta?.n_sensors) setNSensors(j.meta.n_sensors);
       return j;
@@ -312,7 +441,12 @@ const App: React.FC = () => {
   useEffect(() => {
     const onResize = () => setViewport({ w: window.innerWidth, h: window.innerHeight });
     window.addEventListener('resize', onResize);
-    return () => { window.removeEventListener('resize', onResize); abortRef.current?.abort(); };
+    return () => {
+      window.removeEventListener('resize', onResize);
+      abortRef.current?.abort();
+      customAbortRef.current?.abort();
+      spherePreviewAbortRef.current?.abort();
+    };
   }, []);
 
   const checkHealthAt = async (base: string): Promise<HealthResponse> => {
@@ -398,6 +532,58 @@ const App: React.FC = () => {
     return () => { cancelled = true; };
   }, [bootPhase, apiBase, sensor]);
 
+  useEffect(() => {
+    if (bootPhase !== 'ready' || !api || !weatherOverrideEnabled || !activeWeatherOverride) {
+      setCustomApi(null);
+      setCustomApiError(null);
+      customAbortRef.current?.abort();
+      return;
+    }
+    customAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    customAbortRef.current = ctrl;
+    fetchForecastRequest(sensor, apiBase, {
+      tObs: api.meta.t_obs,
+      weatherOverride: activeWeatherOverride,
+      signal: ctrl.signal,
+    })
+      .then((j) => {
+        setCustomApi(j);
+        setCustomApiError(null);
+      })
+      .catch((e: any) => {
+        if (e?.name === 'AbortError') return;
+        setCustomApiError(String(e?.message ?? e));
+      });
+    return () => ctrl.abort();
+  }, [bootPhase, apiBase, api, sensor, weatherOverrideEnabled, activeWeatherOverride]);
+
+  useEffect(() => {
+    if (!isSphereOpen || !api) return;
+    setSpherePreview((prev) => prev ?? { sensor, tObs: api.meta.t_obs });
+  }, [isSphereOpen, api, sensor]);
+
+  useEffect(() => {
+    if (!isSphereOpen || !spherePreview) {
+      spherePreviewAbortRef.current?.abort();
+      setSpherePreviewApi(null);
+      return;
+    }
+    spherePreviewAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    spherePreviewAbortRef.current = ctrl;
+    fetchForecastRequest(spherePreview.sensor, apiBase, {
+      tObs: spherePreview.tObs,
+      signal: ctrl.signal,
+    })
+      .then((j) => setSpherePreviewApi(j))
+      .catch((e) => {
+        if ((e as any)?.name === 'AbortError') return;
+        console.error('[App] Failed to fetch sphere preview:', e);
+      });
+    return () => ctrl.abort();
+  }, [isSphereOpen, spherePreview?.sensor, spherePreview?.tObs, apiBase]);
+
   const uiVisible = bootPhase === 'ready';
   const logoMode = bootPhase === 'checking' || bootPhase === 'error' ? 'center' : 'corner';
   const weatherVisual = deriveWeatherVisual(api?.current_weather);
@@ -425,6 +611,7 @@ const App: React.FC = () => {
       const predTimes = api.prediction_series.times;
       let observed: number[] = [];
       let predicted: number[] = [];
+      let branchPredicted: number[] | undefined;
       let referenceValue: number | undefined;
       let referenceLabel: string | undefined;
       let metricLabel = '';
@@ -433,6 +620,7 @@ const App: React.FC = () => {
       if (m === 'speed') {
         observed = api.history_tail.speed_kmh;
         predicted = api.prediction_series.speed_kmh;
+        branchPredicted = customApi?.prediction_series?.speed_kmh;
         referenceValue = api.current.baseline_speed_kmh;
         referenceLabel = '历史统计均值';
         metricLabel = '速度监控';
@@ -440,6 +628,7 @@ const App: React.FC = () => {
       } else if (m === 'occupancy') {
         observed = api.history_tail.occupancy_pct;
         predicted = api.prediction_series.occupancy_pct;
+        branchPredicted = customApi?.prediction_series?.occupancy_pct;
         referenceValue = api.current.baseline_occupancy_pct;
         referenceLabel = '历史统计均值';
         metricLabel = '路段占有率';
@@ -447,6 +636,7 @@ const App: React.FC = () => {
       } else if (m === 'flow') {
         observed = api.history_tail.flow_veh_5min;
         predicted = api.prediction_series.flow_veh_5min;
+        branchPredicted = customApi?.prediction_series?.flow_veh_5min;
         referenceValue = api.current.baseline_flow_veh_5min;
         referenceLabel = '历史统计均值';
         metricLabel = '实时流量';
@@ -454,6 +644,7 @@ const App: React.FC = () => {
       } else {
         observed = api.history_tail.risk_score;
         predicted = api.prediction_series.risk_score;
+        branchPredicted = customApi?.prediction_series?.risk_score;
         referenceValue = 0.6;
         referenceLabel = '高风险';
         metricLabel = '叠加风险指数';
@@ -474,15 +665,25 @@ const App: React.FC = () => {
       });
 
       // Unified Dynamic Limit Calculation (Sync with ForecastChart logic)
-      const allY = [...observed, ...predicted];
+      const allY = [...observed, ...predicted, ...(branchPredicted ?? [])];
       const rawMin = Math.min(...allY, referenceValue ?? Infinity);
       const rawMax = Math.max(...allY, referenceValue ?? -Infinity);
       const limit = rawMax + ((rawMax - rawMin) * 0.2 || 1);
 
-      configs[m] = { data, referenceValue, referenceLabel, metricLabel, unit, multiDayData, weeklyTimes: api.weekly_compare?.times, limit };
+      configs[m] = {
+        data,
+        referenceValue,
+        referenceLabel,
+        metricLabel,
+        unit,
+        multiDayData,
+        weeklyTimes: api.weekly_compare?.times,
+        limit,
+        branchPredicted: weatherOverrideEnabled ? branchPredicted : undefined,
+      };
     });
     return configs;
-  }, [api]);
+  }, [api, customApi, weatherOverrideEnabled]);
 
   const predictionStartIdx = api ? Math.max(api.history_tail.times.length - 1, 0) : 0;
   const activeChart = chartConfigs[selectedMetric];
@@ -620,10 +821,27 @@ const App: React.FC = () => {
         )}
       </AnimatePresence>
       <NetworkSphereModal
-        isOpen={isSphereOpen} onClose={() => setIsSphereOpen(false)}
-        onSelectSensor={(idx) => { setSensor(idx); setIsSphereOpen(false); }}
+        isOpen={isSphereOpen} onClose={() => { setIsSphereOpen(false); setSpherePreview(null); setSpherePreviewApi(null); }}
+        onSelectSensor={(idx) => { setSensor(idx); setIsSphereOpen(false); setSpherePreview(null); setSpherePreviewApi(null); }}
         onToggleViewMode={() => setPanoramaMode((p) => p === 'weather' ? 'congestion' : p === 'congestion' ? 'spacetime' : 'weather')}
-        graphData={graphData} globalLevels={api?.global_state?.pred_levels ?? []} selectedSensor={sensor} viewMode={panoramaMode} weather={api?.weather} spacetimeMonths={spacetimeMonths}
+        graphData={graphData}
+        globalLevels={(isSphereOpen ? spherePreviewApi?.global_state?.pred_levels : undefined) ?? api?.global_state?.pred_levels ?? []}
+        selectedSensor={sensor}
+        highlightedSensor={spherePreview?.sensor ?? null}
+        viewMode={panoramaMode}
+        weather={(isSphereOpen ? spherePreviewApi?.weather : undefined) ?? api?.weather}
+        spacetimeMonths={spacetimeMonths}
+        sensorCount={nSensors}
+        currentTimeIndex={api?.meta?.t_obs}
+        maxTimeIndex={(api?.dataset_context?.time_steps ?? 1) - 1}
+        previewSensor={spherePreview?.sensor ?? null}
+        previewTimeIndex={spherePreview?.tObs ?? null}
+        onPreviewChange={(previewSensor, previewTimeIndex) => {
+          setSpherePreview((prev) => {
+            if (prev && prev.sensor === previewSensor && prev.tObs === previewTimeIndex) return prev;
+            return { sensor: previewSensor, tObs: previewTimeIndex };
+          });
+        }}
       />
 
       <motion.div
@@ -645,9 +863,116 @@ const App: React.FC = () => {
                     hideTitle={true}
                     background={false}
                     className="drop-shadow-[0_0_30px_rgba(255,255,255,0.1)]"
+                    onCenterClick={() => setWeatherPanelOpen((v) => !v)}
                   />
                 )}
               </div>
+
+              <AnimatePresence>
+                {weatherPanelOpen && (
+                  <motion.div
+                    initial={{ opacity: 0, x: 20, y: -10 }}
+                    animate={{ opacity: 1, x: 0, y: 0 }}
+                    exit={{ opacity: 0, x: 20, y: -10 }}
+                    transition={{ duration: 0.25 }}
+                    className="fixed top-28 right-8 z-[220] w-[420px] rounded-2xl border border-cyan-500/20 bg-[#090b11]/95 p-4 backdrop-blur-xl shadow-[0_20px_60px_rgba(0,0,0,0.45)] pointer-events-auto"
+                  >
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="text-[11px] font-black tracking-[0.18em] text-cyan-300 uppercase">天气情景注入</div>
+                      <button
+                        className="text-[10px] text-zinc-400 hover:text-white transition-colors"
+                        onClick={() => setWeatherPanelOpen(false)}
+                      >
+                        关闭
+                      </button>
+                    </div>
+                    <div className="flex gap-2 mb-3">
+                      <button
+                        onClick={() => setWeatherMode('preset')}
+                        className={`px-3 py-1.5 rounded-lg text-[10px] font-black tracking-widest uppercase ${weatherMode === 'preset' ? 'bg-white text-black' : 'bg-zinc-900 text-zinc-300'}`}
+                      >
+                        预设
+                      </button>
+                      <button
+                        onClick={() => setWeatherMode('custom')}
+                        className={`px-3 py-1.5 rounded-lg text-[10px] font-black tracking-widest uppercase ${weatherMode === 'custom' ? 'bg-white text-black' : 'bg-zinc-900 text-zinc-300'}`}
+                      >
+                        自定义
+                      </button>
+                      <button
+                        onClick={() => setWeatherOverrideEnabled((v) => !v)}
+                        className={`ml-auto px-3 py-1.5 rounded-lg text-[10px] font-black tracking-widest uppercase ${weatherOverrideEnabled ? 'bg-orange-500 text-black' : 'bg-zinc-900 text-zinc-300'}`}
+                      >
+                        {weatherOverrideEnabled ? '分支开启' : '分支关闭'}
+                      </button>
+                    </div>
+
+                    {weatherMode === 'preset' ? (
+                      <div className="grid grid-cols-2 gap-2">
+                        {WEATHER_PRESETS.map((p) => (
+                          <button
+                            key={p.key}
+                            onClick={() => setWeatherPreset(p.key)}
+                            className={`text-left rounded-xl border px-3 py-2 transition-colors ${weatherPreset === p.key ? 'border-cyan-300/70 bg-cyan-400/10' : 'border-white/10 bg-white/[0.02] hover:bg-white/[0.05]'}`}
+                          >
+                            <div className="text-[11px] font-bold text-white">{p.label}</div>
+                            <div className="text-[9px] text-zinc-400 leading-snug">{p.desc}</div>
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {[
+                          { key: 'temp_c', label: '温度 °C', min: -5, max: 45, step: 0.5 },
+                          { key: 'humidity', label: '湿度 %', min: 0, max: 100, step: 1 },
+                          { key: 'precip_mm', label: '降水 mm/h', min: 0, max: 25, step: 0.1 },
+                          { key: 'wind_kmh', label: '风速 km/h', min: 0, max: 80, step: 1 },
+                          { key: 'cloudcover', label: '云量 %', min: 0, max: 100, step: 1 },
+                          { key: 'visibility_km', label: '能见度 km', min: 0.2, max: 20, step: 0.1 },
+                        ].map((f) => (
+                          <label key={f.key} className="block">
+                            <div className="flex items-center justify-between text-[10px] mb-1">
+                              <span className="text-zinc-300 font-bold">{f.label}</span>
+                              <span className="text-cyan-300 font-mono">{(weatherCustom as any)[f.key]}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={f.min}
+                              max={f.max}
+                              step={f.step}
+                              value={(weatherCustom as any)[f.key]}
+                              onChange={(e) => {
+                                const v = Number(e.target.value);
+                                setWeatherCustom((prev: any) => ({ ...prev, [f.key]: v }));
+                              }}
+                              className="w-full accent-cyan-400"
+                            />
+                          </label>
+                        ))}
+                        <button
+                          onClick={() => {
+                            if (!api?.current_weather) return;
+                            setWeatherCustom({
+                              temp_c: Number(api.current_weather.temp_c.toFixed(1)),
+                              humidity: Number(api.current_weather.humidity.toFixed(0)),
+                              precip_mm: Number(api.current_weather.precip_mm.toFixed(2)),
+                              wind_kmh: Number(api.current_weather.wind_kmh.toFixed(1)),
+                              cloudcover: Number(api.current_weather.cloudcover.toFixed(0)),
+                              visibility_km: Number(api.current_weather.visibility_km.toFixed(1)),
+                            });
+                          }}
+                          className="mt-1 px-3 py-1.5 rounded-lg text-[10px] font-bold bg-zinc-800 text-zinc-200 hover:bg-zinc-700 transition-colors"
+                        >
+                          以当前天气为基准
+                        </button>
+                      </div>
+                    )}
+                    {customApiError && weatherOverrideEnabled && (
+                      <div className="mt-3 text-[10px] text-rose-300">{customApiError}</div>
+                    )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
 
               {/* Developer Entrance Button - Positioned left of the weather chart to avoid blockage */}
               <div className="fixed top-12 right-[880px] z-[150] pointer-events-auto flex gap-3">
@@ -685,6 +1010,8 @@ const App: React.FC = () => {
                         weeklyTimes={activeChart.weeklyTimes}
                         simTime={api.meta.sim_time}
                         forcedMax={activeChart.limit}
+                        branchPredicted={activeChart.branchPredicted}
+                        branchLabel={weatherOverrideEnabled ? '自定义天气分支' : undefined}
                       />
                     )}
                   </div>
