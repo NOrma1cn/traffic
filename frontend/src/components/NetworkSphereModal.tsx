@@ -23,7 +23,7 @@ export type PanoramaMode = 'weather' | 'congestion' | 'spacetime';
 interface NetworkSphereModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSelectSensor: (sensorIdx: number) => void;
+  onSelectSensor: (sensorIdx: number, timeIndex: number) => void;
   onSelectNation?: (nationIdx: number) => void;
   onToggleViewMode?: () => void;
   graphData: { nodes: any[]; links: any[]; metadata?: any } | null;
@@ -37,6 +37,7 @@ interface NetworkSphereModalProps {
   spacetimeMonths?: number[];
   sensorCount?: number;
   currentTimeIndex?: number;
+  currentSimTime?: string | null;
   maxTimeIndex?: number;
   previewSensor?: number | null;
   previewTimeIndex?: number | null;
@@ -70,6 +71,9 @@ const SENSOR_WIDGET_MIN_WIDTH = 56;
 const SENSOR_WIDGET_MAX_WIDTH = 320;
 const SENSOR_WIDGET_ANIMATION_MS = 500;
 const SENSOR_HANDLE_WIDTH = 28;
+const DAY_START_SLOT = 0;
+const CAMERA_FOCUS_LERP = 0.045;
+const CAMERA_FOCUS_DONE_EPS_SQ = 0.000001;
 const DAYS_IN_MONTH_2023 = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const MONTH_MAPPING = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 const FINAL_ANGLES = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180];
@@ -80,10 +84,31 @@ function clampMonth(month: number) {
   return Math.max(1, Math.min(12, m));
 }
 
+function wrapMonth(month: number) {
+  const normalized = ((Math.floor(month) - 1) % 12 + 12) % 12;
+  return normalized + 1;
+}
+
 function clampDay(month: number, day: number) {
   const m = clampMonth(month);
   const max = DAYS_IN_MONTH_2023[m - 1] ?? 31;
   return Math.max(1, Math.min(max, Math.floor(day)));
+}
+
+function getDaysInMonth(month: number) {
+  return DAYS_IN_MONTH_2023[clampMonth(month) - 1] ?? 31;
+}
+
+function formatSimTimeLabel(simTime?: string | null) {
+  if (!simTime) return '--';
+  const date = new Date(simTime);
+  if (Number.isNaN(date.getTime())) return simTime;
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const min = String(date.getMinutes()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
 }
 
 function tObsToMonthDay(tObs: number): { month: number; day: number } {
@@ -130,6 +155,11 @@ function widthToSensorId(width: number, sensorCount: number): number {
 
 function easeOutQuart(x: number): number {
   return 1 - Math.pow(1 - x, 4);
+}
+
+function getRenderPixelRatio(width: number, height: number) {
+  const maxPixelRatio = width * height >= 1600 * 900 ? 1 : 1.25;
+  return Math.min(window.devicePixelRatio || 1, maxPixelRatio);
 }
 
 /* ─────────────────── Helpers ─────────────────── */
@@ -228,8 +258,7 @@ function drawCongestionBadge(
   ctx.restore();
 }
 
-function orientCameraToSensor(
-  camera: THREE.PerspectiveCamera,
+function getCameraFocusPose(
   sensorPositions: THREE.Vector3[],
   selectedSensor: number,
   distance: number,
@@ -239,12 +268,22 @@ function orientCameraToSensor(
     ? sensorPositions[selectedSensor]
     : null;
   const viewDir = selectedPos ? selectedPos.clone().normalize() : fallbackDir;
-
-  camera.position.copy(viewDir.clone().multiplyScalar(distance));
-
+  const position = viewDir.clone().multiplyScalar(distance);
   const worldUp = Math.abs(viewDir.y) > 0.92 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(0, 1, 0);
   const side = new THREE.Vector3().crossVectors(worldUp, viewDir).normalize();
-  camera.up.copy(new THREE.Vector3().crossVectors(viewDir, side).normalize());
+  const up = new THREE.Vector3().crossVectors(viewDir, side).normalize();
+  return { position, up };
+}
+
+function orientCameraToSensor(
+  camera: THREE.PerspectiveCamera,
+  sensorPositions: THREE.Vector3[],
+  selectedSensor: number,
+  distance: number,
+) {
+  const { position, up } = getCameraFocusPose(sensorPositions, selectedSensor, distance);
+  camera.position.copy(position);
+  camera.up.copy(up);
   camera.lookAt(0, 0, 0);
 }
 
@@ -439,17 +478,10 @@ function buildScene(
     spacetimeMonths: number[];
   }>,
   onSelectSensor: (idx: number) => void,
-  onZoomChange: (dist: number) => void
+  onZoomChange: (dist: number) => void,
+  onFpsUpdate?: (fps: number) => void,
 ): () => void {
   const sensorCount = sensorPositions.length;
-  
-  console.log('[buildScene] Starting with:', {
-    canvasWidth: canvas.clientWidth,
-    canvasHeight: canvas.clientHeight,
-    sensorCount,
-    nationCount: nations.length,
-    borderEdgeCount: borderEdges.length,
-  });
   
   // Ensure canvas has valid dimensions
   if (canvas.clientWidth === 0 || canvas.clientHeight === 0) {
@@ -465,12 +497,7 @@ function buildScene(
 
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
   renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  
-  console.log('[buildScene] Renderer created:', {
-    width: renderer.domElement.width,
-    height: renderer.domElement.height,
-  });
+  renderer.setPixelRatio(getRenderPixelRatio(canvas.clientWidth, canvas.clientHeight));
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(45, canvas.clientWidth / canvas.clientHeight, 0.1, 50);
@@ -481,11 +508,6 @@ function buildScene(
     6.5,
   );
   
-  console.log('[buildScene] Camera positioned:', {
-    position: camera.position.toArray(),
-    aspect: camera.aspect,
-  });
-
   const getNationLevel = (nationIdx: number, levels: number[]) => {
     const sensorIds = nations[nationIdx]?.childSensors ?? [];
     if (sensorIds.length === 0) return 0;
@@ -727,20 +749,19 @@ function buildScene(
   nodeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   scene.add(nodeMesh);
 
-  // Dedicated hollow square mesh for the currently highlighted (previewing) sensor
-  const focusSquareGeo = new THREE.RingGeometry(0.82, 1.0, 4);
-  focusSquareGeo.rotateZ(Math.PI / 4); // Rotate diamond into a square
-  const focusSquareMat = new THREE.MeshBasicMaterial({
-    color: 0x00ffff,
+  // Dedicated green accent ring that hugs the highlighted node's outer edge
+  const focusRingGeo = new THREE.RingGeometry(1.05, 1.22, 32);
+  const focusRingMat = new THREE.MeshBasicMaterial({
+    color: 0x4ade80,
     transparent: true,
     opacity: 0.95,
     side: THREE.DoubleSide,
     depthWrite: false,
     depthTest: true,
   });
-  const focusSquareMesh = new THREE.Mesh(focusSquareGeo, focusSquareMat);
-  focusSquareMesh.visible = false;
-  scene.add(focusSquareMesh);
+  const focusRingMesh = new THREE.Mesh(focusRingGeo, focusRingMat);
+  focusRingMesh.visible = false;
+  scene.add(focusRingMesh);
 
   // Distribute specific location matrices
   const dummy = new THREE.Object3D();
@@ -748,19 +769,21 @@ function buildScene(
   const nodeTargetColors = Array.from({ length: sensorCount }, () => new THREE.Color(0x000000));
   const nodeCurrentScales = new Float32Array(sensorCount);
   const nodeTargetScales = new Float32Array(sensorCount);
+  const sensorFaceColors = Array.from({ length: sensorCount }, () => new THREE.Color());
+  const sensorFaceAlphas = new Float32Array(sensorCount);
   const nodeNormal = new THREE.Vector3();
   const nodeBaseQuat = new THREE.Quaternion();
   const pulseColor = new THREE.Color();
   const sensorPulseAngles = new Float32Array(sensorCount);
   const sensorOverlayMix = new Float32Array(sensorCount).fill(latestProps.current.viewMode === 'congestion' ? 1 : 0);
   const sensorOverlayStartMix = new Float32Array(sensorCount).fill(latestProps.current.viewMode === 'congestion' ? 1 : 0);
-  const nationOverlayMix = new Float32Array(nations.length).fill(latestProps.current.viewMode === 'congestion' ? 1 : 0);
   let hoveredNation = -1;
   let hoveredSensor = -1;
   let activeSelectedSensor = latestProps.current.selectedSensor;
   let activeHighlightedSensor = latestProps.current.highlightedSensor ?? -1;
   let activeFocusSensor = latestProps.current.highlightedSensor ?? latestProps.current.selectedSensor;
   let activeViewMode = latestProps.current.viewMode;
+  let activeGlobalLevels = latestProps.current.globalLevels;
   let pulseOriginSensor = activeFocusSensor;
   let pulseElapsed = 0;
   // 加快脉冲速度
@@ -779,23 +802,16 @@ function buildScene(
   let borderBrightness = 0.5; // 0.5 = 正常，1.0 = 高亮（白色）
   let borderBrightnessTarget = latestProps.current.viewMode === 'spacetime' ? 1.0 : 0.5;
   let borderBrightnessTransitionDuration = 0.6;
+  let faceColorsNeedUpdate = true;
+  let pointerInside = false;
+  let hoverNeedsUpdate = false;
   
   // 智能过渡系统：记录上一次切换的时间，避免快速连续切换导致的跳跃
   let lastModeSwitchTime = 0;
   let minSwitchInterval = 0.3; // 最小切换间隔（秒）
-
-  const syncNationOverlayMix = () => {
-    for (let ni = 0; ni < nations.length; ni++) {
-      const childSensors = nations[ni]?.childSensors ?? [];
-      if (childSensors.length === 0) {
-        nationOverlayMix[ni] = 0;
-        continue;
-      }
-      let sum = 0;
-      for (const sensorId of childSensors) sum += sensorOverlayMix[sensorId] ?? 0;
-      nationOverlayMix[ni] = sum / childSensors.length;
-    }
-  };
+  const cameraTargetDir = camera.position.clone().normalize();
+  const cameraTargetUp = camera.up.clone();
+  let cameraFocusTransitionActive = false;
 
   const setPulseOrigin = (originSensor: number) => {
     pulseOriginSensor = originSensor >= 0 && originSensor < sensorCount ? originSensor : 0;
@@ -875,8 +891,7 @@ function buildScene(
         // Node specific congestion color
         const level = globalLevels[i] ?? 0;
         if (isHighlighted && !isTargeted) {
-            // Hide instanced node ring when using the dedicated square focus mesh
-            nodeTargetScales[i] = 0.0001;
+            nodeTargetScales[i] = 0.05;
             nodeTargetColors[i].copy(levelToNodeColor(level));
         } else if (isTargeted) {
             nodeTargetScales[i] = 0.07;
@@ -896,12 +911,15 @@ function buildScene(
   updateNodes(); // initial
   setPulseOrigin(activeFocusSensor);
   pulseElapsed = 0; // 从0开始，让脉冲可见
-  syncNationOverlayMix();
 
   /* ── Raycaster Click Logic ── */
   const raycaster = new THREE.Raycaster();
   const mouse = new THREE.Vector2();
   const mousedownPos = { x: 0, y: 0 };
+  const markHoverDirty = () => {
+    if (!pointerInside) return;
+    hoverNeedsUpdate = true;
+  };
 
   const handlePointer = (e: MouseEvent | { clientX: number, clientY: number }) => {
     const rect = canvas.getBoundingClientRect();
@@ -934,12 +952,7 @@ function buildScene(
           // PRECISION FIX: Check if the click point is actually near the node centroid
           const distToNode = hits[0].point.distanceTo(sensorPositions[sensorIdx]);
           if (distToNode < 0.15) {
-              const highlighted = latestProps.current.highlightedSensor;
-              if (highlighted === null || highlighted === undefined || highlighted < 0) {
-                onSelectSensor(sensorIdx);
-              } else if (sensorIdx === highlighted) {
-                onSelectSensor(sensorIdx);
-              }
+              onSelectSensor(sensorIdx);
           }
       }
     }
@@ -947,11 +960,16 @@ function buildScene(
   canvas.addEventListener('click', onClick);
 
   const onMouseMove = (e: MouseEvent) => {
+    pointerInside = true;
+    hoverNeedsUpdate = true;
     handlePointer(e);
   };
   canvas.addEventListener('mousemove', onMouseMove);
+  controls.addEventListener('change', markHoverDirty);
 
   const onMouseLeave = () => {
+    pointerInside = false;
+    hoverNeedsUpdate = false;
     hoveredNation = -1;
     hoveredSensor = -1;
     updateNodes();
@@ -963,6 +981,7 @@ function buildScene(
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
     renderer.setSize(w, h, false);
+    renderer.setPixelRatio(getRenderPixelRatio(w, h));
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     controls.handleResize();
@@ -1017,8 +1036,9 @@ function buildScene(
   let animId = 0;
   let elapsed = 0;
   let lastFrame = performance.now();
+  let fpsLastSampleAt = lastFrame;
+  let fpsFrames = 0;
   let lastDist = camera.position.length(); // 使用实际相机距离初始化
-  let frameCount = 0;
   let initialZoomReported = false; // 标记是否已报告初始缩放
 
   const animate = () => {
@@ -1027,17 +1047,14 @@ function buildScene(
     const dt = (now - lastFrame) / 1000;
     lastFrame = now;
     elapsed += dt;
-    
-    // Log first few frames for debugging
-    if (frameCount < 3) {
-      console.log(`[buildScene] Frame ${frameCount}:`, {
-        cameraPos: camera.position.toArray(),
-        sceneChildren: scene.children.length,
-        elapsed,
-      });
+    fpsFrames += 1;
+    if (onFpsUpdate && now - fpsLastSampleAt >= 250) {
+      const sampledFps = (fpsFrames * 1000) / Math.max(now - fpsLastSampleAt, 1);
+      onFpsUpdate(Math.round(sampledFps));
+      fpsFrames = 0;
+      fpsLastSampleAt = now;
     }
-    frameCount++;
-
+    
     // Zoomed-in views need finer rotation control to avoid overshooting small regions.
     const controlDist = camera.position.length();
     const zoomFactor = THREE.MathUtils.clamp(
@@ -1060,19 +1077,24 @@ function buildScene(
       onZoomChange(dist);
     }
     
-    // ── Update Hover Scanner ──
-    const hits = raycaster.intersectObject(mapMesh);
     let newHoverNation = -1;
     let newHoveredSensor = -1;
-    if (hits.length > 0 && hits[0].faceIndex !== undefined) {
-        const sIdx = faceToSensor[hits[0].faceIndex];
-        if (sIdx !== undefined) {
-            // BROAD HOVER: Any territory hit triggers the nation-wide scan
-            newHoverNation = sensorToNation[sIdx];
-            if (hits[0].point.distanceTo(sensorPositions[sIdx]) < 0.15) {
-              newHoveredSensor = sIdx;
-            }
-        }
+    if (hoverNeedsUpdate && pointerInside) {
+      const hits = raycaster.intersectObject(mapMesh);
+      if (hits.length > 0 && hits[0].faceIndex !== undefined) {
+          const sIdx = faceToSensor[hits[0].faceIndex];
+          if (sIdx !== undefined) {
+              // BROAD HOVER: Any territory hit triggers the nation-wide scan
+              newHoverNation = sensorToNation[sIdx];
+              if (hits[0].point.distanceTo(sensorPositions[sIdx]) < 0.15) {
+                newHoveredSensor = sIdx;
+              }
+          }
+      }
+      hoverNeedsUpdate = false;
+    } else {
+      newHoverNation = hoveredNation;
+      newHoveredSensor = hoveredSensor;
     }
     
     const { selectedSensor, highlightedSensor, viewMode } = latestProps.current;
@@ -1082,17 +1104,23 @@ function buildScene(
     const highlightedChanged = normalizedHighlighted !== activeHighlightedSensor;
     const focusChanged = focusSensor !== activeFocusSensor;
     const modeChanged = viewMode !== activeViewMode;
+    const levelsChanged = latestProps.current.globalLevels !== activeGlobalLevels;
     if (
       newHoverNation !== hoveredNation ||
       newHoveredSensor !== hoveredSensor ||
       sensorChanged ||
       highlightedChanged ||
       focusChanged ||
-      modeChanged
+      modeChanged ||
+      levelsChanged
     ) {
         hoveredNation = newHoverNation;
         hoveredSensor = newHoveredSensor;
         updateNodes();
+        if (levelsChanged) {
+          activeGlobalLevels = latestProps.current.globalLevels;
+          faceColorsNeedUpdate = true;
+        }
         if (modeChanged) {
           // 智能过渡：检查距离上次切换的时间
           const timeSinceLastSwitch = elapsed - lastModeSwitchTime;
@@ -1107,12 +1135,15 @@ function buildScene(
           }
           
           lastModeSwitchTime = elapsed;
+          faceColorsNeedUpdate = true;
         } else if ((sensorChanged || highlightedChanged || focusChanged) && activeViewMode === 'weather' && !congestionTransitionActive && congestionTransitionTarget === 0) {
-          resetPulse(focusSensor);
+          faceColorsNeedUpdate = true;
         }
         if (focusChanged) {
-          orientCameraToSensor(camera, sensorPositions, focusSensor, camera.position.length());
-          controls.update();
+          const nextPose = getCameraFocusPose(sensorPositions, focusSensor, camera.position.length());
+          cameraTargetDir.copy(nextPose.position).normalize();
+          cameraTargetUp.copy(nextPose.up);
+          cameraFocusTransitionActive = true;
         }
         activeSelectedSensor = selectedSensor;
         activeHighlightedSensor = normalizedHighlighted;
@@ -1122,6 +1153,8 @@ function buildScene(
 
     // ── Polygon Face State ──
     pulseElapsed += dt;
+    const pulseTotalDuration = pulseTravelDuration + pulseRiseDuration + pulseHoldDuration + pulseFadeDuration;
+    const pulseActive = pulseElapsed <= pulseTotalDuration;
     let maxOverlayMix = 0;
     if (congestionTransitionActive) {
       congestionTransitionElapsed += dt;
@@ -1150,11 +1183,12 @@ function buildScene(
       }
     } else {
       maxOverlayMix = congestionTransitionTarget;
-      for (let i = 0; i < sensorCount; i++) {
-        sensorOverlayMix[i] = congestionTransitionTarget;
+      if (faceColorsNeedUpdate) {
+        for (let i = 0; i < sensorCount; i++) {
+          sensorOverlayMix[i] = congestionTransitionTarget;
+        }
       }
     }
-    syncNationOverlayMix();
     const showCongestionOverlay = congestionTransitionTarget === 1 || congestionTransitionActive || maxOverlayMix > 0.001;
     
     // Smoothly update shader mode uniform
@@ -1162,72 +1196,101 @@ function buildScene(
     const targetUMode = (congestionTransitionTarget > 0.5 || congestionTransitionActive) ? 1.0 : 0.0;
     haloMat.uniforms.uMode.value = THREE.MathUtils.lerp(curUMode, targetUMode, 0.1);
 
-    for (let triIdx = 0; triIdx < faceToSensor.length; triIdx++) {
-      const sensorIdx = faceToSensor[triIdx];
-      const sensorLevel = latestProps.current.globalLevels[sensorIdx] ?? 0;
+    if (congestionTransitionActive) {
+      faceColorsNeedUpdate = true;
+    }
+    if (faceColorsNeedUpdate || pulseActive) {
+      for (let sensorIdx = 0; sensorIdx < sensorCount; sensorIdx++) {
+        const sensorLevel = latestProps.current.globalLevels[sensorIdx] ?? 0;
+        let alpha = 0;
+        const angle = sensorPulseAngles[sensorIdx] ?? pulseMaxAngle;
+        const arrivalTime = angle / Math.max(pulseAngularSpeed, 0.001);
+        const localPulseElapsed = pulseElapsed - arrivalTime;
+        const congestionMix = THREE.MathUtils.clamp(sensorLevel / 3.0, 0, 1);
 
-      let alpha = 0;
-      const angle = sensorPulseAngles[sensorIdx] ?? pulseMaxAngle;
-      const arrivalTime = angle / Math.max(pulseAngularSpeed, 0.001);
-      const localPulseElapsed = pulseElapsed - arrivalTime;
-      const congestionMix = THREE.MathUtils.clamp(sensorLevel / 3.0, 0, 1);
-      
-      // 计算脉冲混合度
-      let pulseMix = 0;
-      let saturation = 1.0;
-      
-      if (localPulseElapsed > 0) {
-        if (localPulseElapsed < pulseRiseDuration) {
-          pulseMix = localPulseElapsed / pulseRiseDuration;
-        } else if (localPulseElapsed < pulseRiseDuration + pulseHoldDuration) {
-          pulseMix = 1.0;
-        } else if (localPulseElapsed < pulseRiseDuration + pulseHoldDuration + pulseFadeDuration) {
-          const fadeProgress = (localPulseElapsed - pulseRiseDuration - pulseHoldDuration) / pulseFadeDuration;
-          pulseMix = 1.0 - fadeProgress;
-          saturation = THREE.MathUtils.lerp(1.0, 0.12, fadeProgress);
+        // 计算脉冲混合度
+        let pulseMix = 0;
+        let saturation = 1.0;
+
+        if (localPulseElapsed > 0) {
+          if (localPulseElapsed < pulseRiseDuration) {
+            pulseMix = localPulseElapsed / pulseRiseDuration;
+          } else if (localPulseElapsed < pulseRiseDuration + pulseHoldDuration) {
+            pulseMix = 1.0;
+          } else if (localPulseElapsed < pulseRiseDuration + pulseHoldDuration + pulseFadeDuration) {
+            const fadeProgress = (localPulseElapsed - pulseRiseDuration - pulseHoldDuration) / pulseFadeDuration;
+            pulseMix = 1.0 - fadeProgress;
+            saturation = THREE.MathUtils.lerp(1.0, 0.12, fadeProgress);
+          }
+        }
+
+        // 脉冲颜色：根据拥堵级别选择
+        const basePulseCol = sensorFaceColors[sensorIdx];
+        if (sensorLevel >= 3) {
+          // 严重拥堵：红色
+          basePulseCol.set(0xff5a4f);
+        } else if (sensorLevel >= 2) {
+          // 高拥堵：橙色
+          basePulseCol.set(0xe37b38);
+        } else if (sensorLevel >= 1) {
+          // 中等拥堵：黄色
+          basePulseCol.set(0xc7a546);
+        } else {
+          // 正常：明亮的蓝色，使用传感器索引生成不同的蓝色调
+          const hue = 0.52 + ((sensorIdx * 73) % 100) * 0.0018; // 蓝色范围 0.52-0.70
+          const sat = 0.75 + ((sensorIdx * 37) % 100) * 0.002; // 饱和度 0.75-0.95
+          const light = 0.55 + ((sensorIdx * 59) % 100) * 0.0015; // 亮度 0.55-0.70
+          basePulseCol.setHSL(hue, sat, light);
+        }
+
+        withSaturation(basePulseCol, saturation, pulseColor);
+        basePulseCol.copy(pulseColor);
+
+        if (showCongestionOverlay) {
+          // 拥堵模式：基础颜色 + 脉冲高亮
+          const baseAlpha = sensorOverlayMix[sensorIdx] * (0.08 + congestionMix * 0.3);
+          alpha = baseAlpha + pulseMix * 0.25;
+        } else {
+          // 天气模式：仅显示脉冲
+          const maxAlpha = 0.55 + congestionMix * 0.25;
+          alpha = pulseMix * maxAlpha;
+        }
+
+        sensorFaceAlphas[sensorIdx] = alpha;
+      }
+
+      for (let triIdx = 0; triIdx < faceToSensor.length; triIdx++) {
+        const sensorIdx = faceToSensor[triIdx];
+        const sensorColor = sensorFaceColors[sensorIdx];
+        const alpha = sensorFaceAlphas[sensorIdx];
+        for (let v = 0; v < 3; v++) {
+          const base = triIdx * 12 + v * 4;
+          faceColorAttr.array[base] = sensorColor.r;
+          faceColorAttr.array[base + 1] = sensorColor.g;
+          faceColorAttr.array[base + 2] = sensorColor.b;
+          faceColorAttr.array[base + 3] = alpha;
         }
       }
+      faceColorsNeedUpdate = congestionTransitionActive || pulseActive;
+      faceColorAttr.needsUpdate = true;
+    }
 
-      // 脉冲颜色：根据拥堵级别选择
-      const basePulseCol = new THREE.Color();
-      if (sensorLevel >= 3) {
-        // 严重拥堵：红色
-        basePulseCol.set(0xff5a4f);
-      } else if (sensorLevel >= 2) {
-        // 高拥堵：橙色
-        basePulseCol.set(0xe37b38);
-      } else if (sensorLevel >= 1) {
-        // 中等拥堵：黄色
-        basePulseCol.set(0xc7a546);
-      } else {
-        // 正常：明亮的蓝色，使用传感器索引生成不同的蓝色调
-        const hue = 0.52 + ((sensorIdx * 73) % 100) * 0.0018; // 蓝色范围 0.52-0.70
-        const sat = 0.75 + ((sensorIdx * 37) % 100) * 0.002; // 饱和度 0.75-0.95
-        const light = 0.55 + ((sensorIdx * 59) % 100) * 0.0015; // 亮度 0.55-0.70
-        basePulseCol.setHSL(hue, sat, light);
+    if (cameraFocusTransitionActive) {
+      const cameraDistance = camera.position.length();
+      const nextDir = camera.position.clone().normalize().lerp(cameraTargetDir, CAMERA_FOCUS_LERP);
+      if (nextDir.lengthSq() > 0.000001) {
+        camera.position.copy(nextDir.normalize().multiplyScalar(cameraDistance));
       }
-      
-      withSaturation(basePulseCol, saturation, pulseColor);
-
-      if (showCongestionOverlay) {
-        // 拥堵模式：基础颜色 + 脉冲高亮
-        const baseAlpha = sensorOverlayMix[sensorIdx] * (0.08 + congestionMix * 0.3);
-        alpha = baseAlpha + pulseMix * 0.25;
-      } else {
-        // 天气模式：仅显示脉冲
-        const maxAlpha = 0.55 + congestionMix * 0.25;
-        alpha = pulseMix * maxAlpha;
-      }
-
-      for (let v = 0; v < 3; v++) {
-        const base = triIdx * 12 + v * 4;
-        faceColorAttr.array[base] = pulseColor.r;
-        faceColorAttr.array[base + 1] = pulseColor.g;
-        faceColorAttr.array[base + 2] = pulseColor.b;
-        faceColorAttr.array[base + 3] = alpha;
+      camera.up.lerp(cameraTargetUp, CAMERA_FOCUS_LERP).normalize();
+      camera.lookAt(0, 0, 0);
+      controls.target.set(0, 0, 0);
+      if (
+        camera.position.clone().normalize().distanceToSquared(cameraTargetDir) < CAMERA_FOCUS_DONE_EPS_SQ &&
+        camera.up.distanceToSquared(cameraTargetUp) < CAMERA_FOCUS_DONE_EPS_SQ
+      ) {
+        cameraFocusTransitionActive = false;
       }
     }
-    faceColorAttr.needsUpdate = true;
 
     // ── Animate 2D Surface Rings ──
     for (let i = 0; i < sensorCount; i++) {
@@ -1258,27 +1321,23 @@ function buildScene(
     nodeMesh.instanceMatrix.needsUpdate = true;
     if (nodeMesh.instanceColor) nodeMesh.instanceColor.needsUpdate = true;
 
-    // ── Update Dedicated Square Highlight Mesh ──
+    // ── Update Dedicated Highlight Ring Mesh ──
     const activeHighlightIdx = latestProps.current.highlightedSensor ?? -1;
-    if (activeHighlightIdx !== -1 && activeHighlightIdx !== selectedSensor && activeHighlightIdx < sensorPositions.length) {
+    if (activeHighlightIdx !== -1 && activeHighlightIdx < sensorPositions.length) {
       const p = sensorPositions[activeHighlightIdx];
       const norm = p.clone().normalize();
-      focusSquareMesh.position.copy(p).addScaledVector(norm, 0.012);
-      focusSquareMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), norm);
-      // Static scale (no breathing) matching the user's preference for consistency
-      const level = latestProps.current.globalLevels[activeHighlightIdx] ?? 0;
-      if (focusSquareMesh.material instanceof THREE.MeshBasicMaterial) {
-        focusSquareMesh.material.color.copy(levelToNodeColor(level));
-      }
-      focusSquareMesh.scale.setScalar(0.12);
-      focusSquareMesh.visible = true;
+      focusRingMesh.position.copy(p).addScaledVector(norm, 0.008);
+      focusRingMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), norm);
+      const focusPulse = 1.0 + Math.sin(elapsed * 5.2) * 0.12;
+      const focusScale = Math.max(nodeCurrentScales[activeHighlightIdx], 0.05) * focusPulse;
+      focusRingMesh.scale.setScalar(focusScale);
+      focusRingMesh.visible = true;
     } else {
-      focusSquareMesh.visible = false;
+      focusRingMesh.visible = false;
     }
 
     // ── Update 3D Floating Weather Plane Decals ──
     for (const wi of weatherIcons) {
-       const nationMix = nationOverlayMix[wi.nIdx] ?? 0;
        const nationLevel = getNationLevel(wi.nIdx, latestProps.current.globalLevels);
        const pct = congestionPercentFromSensors(nations[wi.nIdx]?.childSensors ?? [], latestProps.current.globalLevels);
        if (pct !== wi.lastPct) {
@@ -1366,11 +1425,13 @@ function buildScene(
 
   return () => {
     cancelAnimationFrame(animId);
+    onFpsUpdate?.(0);
     window.removeEventListener('resize', onResize);
     canvas.removeEventListener('mousedown', onMouseDown);
     canvas.removeEventListener('click', onClick);
     canvas.removeEventListener('mousemove', onMouseMove);
     canvas.removeEventListener('mouseleave', onMouseLeave);
+    controls.removeEventListener('change', markHoverDirty);
     controls.dispose();
 
     faceGeo.dispose();
@@ -1379,6 +1440,8 @@ function buildScene(
     borderMat.dispose();
     nodeGeo.dispose();
     nodeMat.dispose();
+    focusRingGeo.dispose();
+    focusRingMat.dispose();
     Object.values(decalMats).forEach((mat) => mat.dispose());
     for (const wi of weatherIcons) {
       wi.weatherMaterial.dispose();
@@ -1414,6 +1477,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   spacetimeMonths,
   sensorCount = 743,
   currentTimeIndex = 0,
+  currentSimTime = null,
   maxTimeIndex = 105119,
   previewSensor = null,
   previewTimeIndex = null,
@@ -1428,6 +1492,10 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     if (Array.isArray(weather)) return weather;
     return [weather];
   }, [weather]);
+  const baseSpacetimeMonths = useMemo(
+    () => spacetimeMonths || Array.from({ length: 12 }, (_, i) => i + 1),
+    [spacetimeMonths],
+  );
 
   // Pass dynamic values through a mutable Ref to completely prevent expensive recreating of Three geometries & resetting OrbitCamera!
   const latestProps = useRef({
@@ -1436,37 +1504,26 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     globalLevels,
     weathersData: weatherArr,
     viewMode,
-    spacetimeMonths: spacetimeMonths || Array.from({ length: 12 }, (_, i) => i + 1),
+    spacetimeMonths: baseSpacetimeMonths,
   });
-
-  useEffect(() => {
-    latestProps.current = { 
-      selectedSensor, 
-      highlightedSensor,
-      globalLevels, 
-      weathersData: weatherArr, 
-      viewMode,
-      spacetimeMonths: spacetimeMonths || Array.from({ length: 12 }, (_, i) => i + 1),
-    };
-  }, [selectedSensor, highlightedSensor, globalLevels, weatherArr, viewMode, spacetimeMonths]);
 
   const [zoomLevel, setZoomLevel] = useState(0); // 0 (far) to 1 (near)
   const safeSensorCount = Math.max(1, Math.floor(sensorCount));
   const effectivePreviewSensor = previewSensor ?? highlightedSensor ?? selectedSensor;
   const effectivePreviewTime = previewTimeIndex ?? currentTimeIndex;
+  const initialWidgetSensorId = clampSensorId(effectivePreviewSensor + 1, safeSensorCount);
   const [timeExpanded, setTimeExpanded] = useState(false);
   const [timeTargetExpanded, setTimeTargetExpanded] = useState(false);
   const [timeAnimating, setTimeAnimating] = useState(false);
+  const [fps, setFps] = useState(0);
   const [dotProgress, setDotProgress] = useState<number[]>(() => Array(12).fill(0));
-  const [widgetSensorId, setWidgetSensorId] = useState(() =>
-    clampSensorId(effectivePreviewSensor + 1, safeSensorCount),
-  );
+  const [widgetSensorId, setWidgetSensorId] = useState(() => initialWidgetSensorId);
   const [isSensorInputOpen, setIsSensorInputOpen] = useState(false);
   const [sensorInputValue, setSensorInputValue] = useState(() =>
-    String(clampSensorId(effectivePreviewSensor + 1, safeSensorCount)),
+    String(initialWidgetSensorId),
   );
   const [sensorSliderWidth, setSensorSliderWidth] = useState(() =>
-    sensorIdToWidth(effectivePreviewSensor + 1, safeSensorCount),
+    sensorIdToWidth(initialWidgetSensorId, safeSensorCount),
   );
   const [widgetMonth, setWidgetMonth] = useState(() => tObsToMonthDay(effectivePreviewTime).month);
   const [widgetDay, setWidgetDay] = useState(() => tObsToMonthDay(effectivePreviewTime).day);
@@ -1479,17 +1536,74 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const isProgrammaticScrollRef = useRef(false);
   const programmaticScrollTimerRef = useRef<number | null>(null);
   const wheelCooldownUntilRef = useRef(0);
+  const suppressPreviewCommitRef = useRef(false);
   const sensorDragActiveRef = useRef(false);
   const sensorDragStartXRef = useRef(0);
-  const sensorDragStartWidthRef = useRef(sensorIdToWidth(effectivePreviewSensor + 1, safeSensorCount));
-  const sensorSliderWidthRef = useRef(sensorIdToWidth(effectivePreviewSensor + 1, safeSensorCount));
+  const sensorDragStartWidthRef = useRef(sensorIdToWidth(initialWidgetSensorId, safeSensorCount));
+  const sensorSliderWidthRef = useRef(sensorIdToWidth(initialWidgetSensorId, safeSensorCount));
+  const widgetSensorIdRef = useRef(initialWidgetSensorId);
   const sensorAnimationFrameRef = useRef<number | null>(null);
+  const latestOnSelectSensorRef = useRef(onSelectSensor);
+  const widgetSelectionRef = useRef({
+    month: tObsToMonthDay(effectivePreviewTime).month,
+    day: tObsToMonthDay(effectivePreviewTime).day,
+  });
 
-  const applySensorWidth = (newWidth: number) => {
+  useEffect(() => {
+    latestOnSelectSensorRef.current = onSelectSensor;
+  }, [onSelectSensor]);
+
+  const commitPreviewSelection = (sensorId = widgetSensorIdRef.current) => {
+    if (!isOpen || !onPreviewChange) return;
+    const nextSensorId = clampSensorId(sensorId, safeSensorCount);
+    const tObs = monthDayToTObs(
+      widgetSelectionRef.current.month,
+      widgetSelectionRef.current.day,
+      DAY_START_SLOT,
+      maxTimeIndex,
+    );
+    const previewSensorIdx = nextSensorId - 1;
+    const prev = lastCommittedPreviewRef.current;
+    if (prev && prev.sensor === previewSensorIdx && prev.tObs === tObs) return;
+    lastCommittedPreviewRef.current = { sensor: previewSensorIdx, tObs };
+    onPreviewChange(previewSensorIdx, tObs);
+  };
+
+  const setWidgetMonthImmediate = (month: number | ((prev: number) => number)) => {
+    const nextMonth = clampMonth(
+      typeof month === 'function' ? month(widgetSelectionRef.current.month) : month,
+    );
+    const nextDay = clampDay(nextMonth, widgetSelectionRef.current.day);
+    widgetSelectionRef.current = {
+      month: nextMonth,
+      day: nextDay,
+    };
+    setWidgetMonth((prev) => (prev === nextMonth ? prev : nextMonth));
+    setWidgetDay((prev) => (prev === nextDay ? prev : nextDay));
+  };
+
+  const setWidgetDayImmediate = (day: number | ((prev: number) => number)) => {
+    const nextDay = clampDay(
+      widgetSelectionRef.current.month,
+      typeof day === 'function' ? day(widgetSelectionRef.current.day) : day,
+    );
+    widgetSelectionRef.current = {
+      month: widgetSelectionRef.current.month,
+      day: nextDay,
+    };
+    setWidgetDay((prev) => (prev === nextDay ? prev : nextDay));
+  };
+
+  const applySliderWidthOnly = (newWidth: number) => {
     const clampedWidth = Math.max(SENSOR_WIDGET_MIN_WIDTH, Math.min(SENSOR_WIDGET_MAX_WIDTH, newWidth));
     sensorSliderWidthRef.current = clampedWidth;
     setSensorSliderWidth((prev) => (Math.abs(prev - clampedWidth) < 0.1 ? prev : clampedWidth));
-    const nextSensorId = widthToSensorId(clampedWidth, safeSensorCount);
+  };
+
+  const applySensorWidth = (newWidth: number) => {
+    applySliderWidthOnly(newWidth);
+    const nextSensorId = widthToSensorId(sensorSliderWidthRef.current, safeSensorCount);
+    widgetSensorIdRef.current = nextSensorId;
     setWidgetSensorId((prev) => (prev === nextSensorId ? prev : nextSensorId));
   };
 
@@ -1507,7 +1621,11 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     sensorDragStartWidthRef.current = startWidth;
   };
 
-  const animateSensorWidth = (targetWidth: number, duration = SENSOR_WIDGET_ANIMATION_MS) => {
+  const animateSensorWidth = (
+    targetWidth: number,
+    duration = SENSOR_WIDGET_ANIMATION_MS,
+    lockedSensorId?: number,
+  ) => {
     const clampedTarget = Math.max(SENSOR_WIDGET_MIN_WIDTH, Math.min(SENSOR_WIDGET_MAX_WIDTH, targetWidth));
     stopSensorAnimation();
 
@@ -1515,17 +1633,33 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     const distance = clampedTarget - startWidth;
     let startTime: number | null = null;
 
+    if (lockedSensorId !== undefined) {
+      widgetSensorIdRef.current = lockedSensorId;
+      setWidgetSensorId((prev) => (prev === lockedSensorId ? prev : lockedSensorId));
+      if (!isSensorInputOpen) {
+        setSensorInputValue(String(lockedSensorId));
+      }
+    }
+
     const step = (timestamp: number) => {
       if (startTime === null) startTime = timestamp;
       const progress = Math.min((timestamp - startTime) / Math.max(1, duration), 1);
       const nextWidth = startWidth + distance * easeOutQuart(progress);
-      applySensorWidth(nextWidth);
+      if (lockedSensorId !== undefined) {
+        applySliderWidthOnly(nextWidth);
+      } else {
+        applySensorWidth(nextWidth);
+      }
 
       if (progress < 1) {
         sensorAnimationFrameRef.current = requestAnimationFrame(step);
       } else {
         sensorAnimationFrameRef.current = null;
-        applySensorWidth(clampedTarget);
+        if (lockedSensorId !== undefined) {
+          applySliderWidthOnly(clampedTarget);
+        } else {
+          applySensorWidth(clampedTarget);
+        }
       }
     };
 
@@ -1536,26 +1670,66 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     if (!isOpen) return;
     const nextSensorId = clampSensorId(effectivePreviewSensor + 1, safeSensorCount);
     const nextWidth = sensorIdToWidth(nextSensorId, safeSensorCount);
+    if (sensorDragActiveRef.current) return;
+    widgetSensorIdRef.current = nextSensorId;
     setWidgetSensorId((prev) => (prev === nextSensorId ? prev : nextSensorId));
-    if (!sensorDragActiveRef.current) {
-      sensorSliderWidthRef.current = nextWidth;
-      setSensorSliderWidth((prev) => (Math.abs(prev - nextWidth) < 0.1 ? prev : nextWidth));
-    }
+    sensorSliderWidthRef.current = nextWidth;
+    setSensorSliderWidth((prev) => (Math.abs(prev - nextWidth) < 0.1 ? prev : nextWidth));
     if (!isSensorInputOpen) {
       setSensorInputValue(String(nextSensorId));
     }
+  }, [isOpen, effectivePreviewSensor, safeSensorCount, isSensorInputOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
     const md = tObsToMonthDay(effectivePreviewTime);
+    suppressPreviewCommitRef.current = true;
+    widgetSelectionRef.current = {
+      month: md.month,
+      day: md.day,
+    };
     setWidgetMonth((prev) => (prev === md.month ? prev : md.month));
     setWidgetDay((prev) => (prev === md.day ? prev : md.day));
-  }, [isOpen, effectivePreviewSensor, effectivePreviewTime, safeSensorCount, isSensorInputOpen]);
+  }, [isOpen, effectivePreviewTime]);
+
+  useEffect(() => {
+    if (!isOpen || !suppressPreviewCommitRef.current) return;
+    const md = tObsToMonthDay(effectivePreviewTime);
+    const expectedSensorId = clampSensorId(effectivePreviewSensor + 1, safeSensorCount);
+    if (widgetMonth !== md.month || widgetDay !== md.day || widgetSensorId !== expectedSensorId) return;
+    lastCommittedPreviewRef.current = {
+      sensor: expectedSensorId - 1,
+      tObs: monthDayToTObs(md.month, md.day, DAY_START_SLOT, maxTimeIndex),
+    };
+    suppressPreviewCommitRef.current = false;
+  }, [
+    isOpen,
+    effectivePreviewSensor,
+    effectivePreviewTime,
+    safeSensorCount,
+    widgetMonth,
+    widgetDay,
+    widgetSensorId,
+    maxTimeIndex,
+  ]);
+
+  useEffect(() => {
+    widgetSelectionRef.current = {
+      month: clampMonth(widgetMonth),
+      day: clampDay(widgetMonth, widgetDay),
+    };
+  }, [widgetMonth, widgetDay]);
 
   useEffect(() => {
     if (isOpen) return;
+    setFps(0);
     lastCommittedPreviewRef.current = null;
     setTimeTargetExpanded(false);
     setIsSensorInputOpen(false);
     wheelCooldownUntilRef.current = 0;
     sensorDragActiveRef.current = false;
+    isProgrammaticScrollRef.current = false;
+    suppressPreviewCommitRef.current = false;
     stopSensorAnimation();
     if (previewCommitTimerRef.current !== null) {
       window.clearTimeout(previewCommitTimerRef.current);
@@ -1578,7 +1752,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     const sc = dateScrollRef.current;
     const day = clampDay(widgetMonth, widgetDay);
     isProgrammaticScrollRef.current = true;
-    sc.scrollTo({ top: (day - 1) * DAY_WIDGET_ITEM_HEIGHT, behavior: 'smooth' });
+    sc.scrollTo({ top: (day - 1) * DAY_WIDGET_ITEM_HEIGHT, behavior: 'auto' });
     if (programmaticScrollTimerRef.current !== null) {
       window.clearTimeout(programmaticScrollTimerRef.current);
     }
@@ -1591,13 +1765,21 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   useEffect(() => {
     const onMouseMove = (event: MouseEvent) => {
       if (!sensorDragActiveRef.current) return;
+      event.preventDefault();
       const deltaX = event.clientX - sensorDragStartXRef.current;
       applySensorWidth(sensorDragStartWidthRef.current + deltaX);
     };
 
     const onMouseUp = () => {
       if (!sensorDragActiveRef.current) return;
+      const nextSensorId = widthToSensorId(sensorSliderWidthRef.current, safeSensorCount);
+      widgetSensorIdRef.current = nextSensorId;
+      setWidgetSensorId((prev) => (prev === nextSensorId ? prev : nextSensorId));
+      if (!isSensorInputOpen) {
+        setSensorInputValue(String(nextSensorId));
+      }
       sensorDragActiveRef.current = false;
+      commitPreviewSelection(nextSensorId);
     };
 
     window.addEventListener('mousemove', onMouseMove);
@@ -1606,7 +1788,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     };
-  }, [safeSensorCount]);
+  }, [safeSensorCount, isSensorInputOpen, isOpen, onPreviewChange, maxTimeIndex]);
 
   useEffect(() => {
     if (!isOpen || !dateScrollRef.current) return;
@@ -1626,7 +1808,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       const direction = Math.sign(deltaY);
       if (direction === 0) return;
 
-      setWidgetDay((prev) => {
+      setWidgetDayImmediate((prev) => {
         const nextDay = clampDay(widgetMonth, prev + direction);
         if (nextDay !== prev) {
           isProgrammaticScrollRef.current = true;
@@ -1680,7 +1862,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       });
       if (skipStateCommit) return;
       const clamped = clampDay(widgetMonth, nearestDay);
-      setWidgetDay((prev) => (prev === clamped ? prev : clamped));
+      setWidgetDayImmediate((prev) => (prev === clamped ? prev : clamped));
     };
 
     let raf = 0;
@@ -1689,7 +1871,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       raf = requestAnimationFrame(() => update(isProgrammaticScrollRef.current));
     };
     sc.addEventListener('scroll', onScroll, { passive: true });
-    update();
+    update(isProgrammaticScrollRef.current);
     return () => {
       cancelAnimationFrame(raf);
       if (programmaticScrollTimerRef.current !== null) {
@@ -1702,34 +1884,18 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
 
   useEffect(() => {
     if (!isOpen || !onPreviewChange) return;
-    const slot = Math.max(0, Math.min(287, effectivePreviewTime % 288));
-    const tObs = monthDayToTObs(widgetMonth, widgetDay, slot, maxTimeIndex);
-    const previewSensorIdx = clampSensorId(widgetSensorId, safeSensorCount) - 1;
-    const prev = lastCommittedPreviewRef.current;
-    if (prev && prev.sensor === previewSensorIdx && prev.tObs === tObs) return;
-    if (previewCommitTimerRef.current !== null) {
-      window.clearTimeout(previewCommitTimerRef.current);
-      previewCommitTimerRef.current = null;
-    }
-    previewCommitTimerRef.current = window.setTimeout(() => {
-      lastCommittedPreviewRef.current = { sensor: previewSensorIdx, tObs };
-      onPreviewChange(previewSensorIdx, tObs);
-      previewCommitTimerRef.current = null;
-    }, 160);
-    return () => {
-      if (previewCommitTimerRef.current !== null) {
-        window.clearTimeout(previewCommitTimerRef.current);
-        previewCommitTimerRef.current = null;
-      }
-    };
-  }, [isOpen, onPreviewChange, widgetSensorId, effectivePreviewTime, widgetMonth, widgetDay, maxTimeIndex, safeSensorCount]);
+    if (sensorDragActiveRef.current) return;
+    if (suppressPreviewCommitRef.current) return;
+    widgetSensorIdRef.current = clampSensorId(widgetSensorId, safeSensorCount);
+    commitPreviewSelection(widgetSensorIdRef.current);
+  }, [isOpen, onPreviewChange, widgetSensorId, widgetMonth, widgetDay, maxTimeIndex, safeSensorCount]);
 
   const toggleTimeAnimation = (toExpand: boolean, selectedMonth?: number) => {
     if (timeAnimating) return;
     if (selectedMonth !== undefined && selectedMonth !== null) {
       const m = clampMonth(selectedMonth);
-      setWidgetMonth(m);
-      setWidgetDay((prev) => clampDay(m, prev));
+      setWidgetMonthImmediate(m);
+      setWidgetDayImmediate((prev) => clampDay(m, prev));
     }
     setTimeTargetExpanded(toExpand);
     setTimeAnimating(true);
@@ -1776,9 +1942,10 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const commitSensorInput = (rawValue?: string) => {
     const parsed = Number.parseInt(String(rawValue ?? sensorInputValue).trim(), 10);
     const nextSensorId = clampSensorId(Number.isFinite(parsed) ? parsed : widgetSensorId, safeSensorCount);
+    widgetSensorIdRef.current = nextSensorId;
     setWidgetSensorId(nextSensorId);
     setSensorInputValue(String(nextSensorId));
-    animateSensorWidth(sensorIdToWidth(nextSensorId, safeSensorCount));
+    animateSensorWidth(sensorIdToWidth(nextSensorId, safeSensorCount), SENSOR_WIDGET_ANIMATION_MS, nextSensorId);
     setIsSensorInputOpen(false);
   };
 
@@ -1796,8 +1963,9 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const handleSensorContainerMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
     const rect = sensorSliderRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const nextWidth = event.clientX - rect.left;
-    animateSensorWidth(nextWidth);
+    const nextSensorId = widthToSensorId(event.clientX - rect.left, safeSensorCount);
+    const nextWidth = sensorIdToWidth(nextSensorId, safeSensorCount);
+    animateSensorWidth(nextWidth, SENSOR_WIDGET_ANIMATION_MS, nextSensorId);
     event.preventDefault();
   };
 
@@ -1808,31 +1976,38 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
 
   /* Build exactly 12 Nations mapping using bottom up Edge Stitching */
   const { nations, sensorPositions, borderEdges, cellPolygons } = useMemo(() => {
-    console.log('[NetworkSphere] Building nations from graphData:', {
-      hasGraphData: !!graphData,
-      nodeCount: graphData?.nodes?.length || 0,
-      hasMetadata: !!graphData?.metadata,
-    });
-    const result = buildNations(graphData, globalLevels);
-    console.log('[NetworkSphere] Built nations:', {
-      nationCount: result.nations.length,
-      sensorCount: result.sensorPositions.length,
-      borderEdgeCount: result.borderEdges.length,
-    });
-    return result;
+    return buildNations(graphData, globalLevels);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graphData]);
 
+  const previewNation = useMemo(() => {
+    const sensorIdx = clampSensorId(widgetSensorId, safeSensorCount) - 1;
+    if (sensorIdx < 0) return -1;
+    return nations.findIndex((nation) => nation.childSensors.includes(sensorIdx));
+  }, [widgetSensorId, safeSensorCount, nations]);
+
+  const displaySpacetimeMonths = useMemo(() => {
+    if (previewNation < 0 || previewNation >= baseSpacetimeMonths.length) {
+      return baseSpacetimeMonths;
+    }
+    const anchorMonth = clampMonth(baseSpacetimeMonths[previewNation] ?? (previewNation + 1));
+    const delta = widgetMonth - anchorMonth;
+    return baseSpacetimeMonths.map((month) => wrapMonth(month + delta));
+  }, [baseSpacetimeMonths, previewNation, widgetMonth]);
+
+  useEffect(() => {
+    latestProps.current = {
+      selectedSensor,
+      highlightedSensor,
+      globalLevels,
+      weathersData: weatherArr,
+      viewMode,
+      spacetimeMonths: displaySpacetimeMonths,
+    };
+  }, [selectedSensor, highlightedSensor, globalLevels, weatherArr, viewMode, displaySpacetimeMonths]);
+
   /* Build scene */
   useEffect(() => {
-    console.log('[NetworkSphere] Effect triggered:', {
-      isOpen,
-      hasCanvas: !!canvasRef.current,
-      nationCount: nations.length,
-      weatherCount: weatherArr.length,
-      hasGraphData: !!graphData
-    });
-    
     if (!isOpen || !canvasRef.current || nations.length === 0) {
       if (isOpen && nations.length === 0) {
         console.warn('[NetworkSphere] Modal is open but nations are empty. graphData state:', !!graphData);
@@ -1851,11 +2026,6 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       month_index: i,
     }));
     
-    console.log('[NetworkSphere] Using weather data:', {
-      original: weatherArr.length,
-      effective: effectiveWeather.length,
-    });
-    
     // Update latestProps with effective weather
     latestProps.current.weathersData = effectiveWeather;
 
@@ -1869,15 +2039,12 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
         const width = canvasRef.current.clientWidth;
         const height = canvasRef.current.clientHeight;
         
-        console.log('[NetworkSphere] Canvas dimensions:', { width, height });
-        
         if (width === 0 || height === 0) {
           console.warn('[NetworkSphere] Canvas has zero dimensions, retrying...');
           setTimeout(checkDimensions, 100);
           return;
         }
         
-        console.log('[NetworkSphere] Building scene...');
         cleanupRef.current = buildScene(
           canvasRef.current,
           nations,
@@ -1885,7 +2052,10 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
           borderEdges,
           cellPolygons,
           latestProps,
-          onSelectSensor,
+          (sensorIdx) => {
+            const { month, day } = widgetSelectionRef.current;
+            latestOnSelectSensorRef.current(sensorIdx, monthDayToTObs(month, day, DAY_START_SLOT, maxTimeIndex));
+          },
           (dist: number) => {
             const z = THREE.MathUtils.clamp(
               (MAX_CAMERA_DISTANCE - dist) / (MAX_CAMERA_DISTANCE - MIN_CAMERA_DISTANCE),
@@ -1894,9 +2064,9 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
             );
             // Throttle state update slightly if needed, but for now direct is fine
             setZoomLevel(z);
-          }
+          },
+          (nextFps: number) => setFps((prev) => (prev === nextFps ? prev : nextFps)),
         );
-        console.log('[NetworkSphere] Scene built successfully');
       };
       
       checkDimensions();
@@ -1908,13 +2078,15 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       cleanupRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, nations]);
+  }, [isOpen, nations, maxTimeIndex]);
 
   // Which nation does the selected sensor belong to?
   const selectedNation = useMemo(() => {
      if (selectedSensor < 0) return -1;
      return nations.findIndex(n => n.childSensors.includes(selectedSensor));
   }, [selectedSensor, nations]);
+  const visibleDayCount = getDaysInMonth(widgetMonth);
+  const simTimeLabel = formatSimTimeLabel(currentSimTime);
 
   // Notify parent which nation the selected sensor belongs to
   useEffect(() => {
@@ -1932,7 +2104,13 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
 
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     onToggleViewMode?.();
+  };
+
+  const swallowContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
   };
 
   return (
@@ -1944,6 +2122,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
           exit={{ opacity: 0, scale: 0.98 }}
           transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
           className="fixed inset-0 z-50 flex items-center justify-center bg-[#050505] overflow-hidden"
+          onContextMenu={swallowContextMenu}
         >
           {/* Vignette */}
           <div className="absolute inset-0 pointer-events-none opacity-50 bg-[radial-gradient(circle_at_center,_transparent_0%,_#000_100%)] z-10" />
@@ -1954,6 +2133,23 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
             className="absolute inset-0 w-full h-full cursor-crosshair z-[5]"
             onContextMenu={handleContextMenu}
           />
+
+          <div className="absolute right-6 top-6 z-[28] pointer-events-none text-right text-white">
+            <div className="text-[11px] font-bold tracking-[0.22em] text-white/55">FPS</div>
+            <div
+              className="text-[28px] font-black leading-none"
+              style={{ fontVariantNumeric: 'tabular-nums' }}
+            >
+              {fps || 0}
+            </div>
+            <div className="mt-3 text-[10px] font-bold tracking-[0.18em] text-white/45">SIM TIME</div>
+            <div
+              className="text-[16px] font-bold leading-tight text-white/88"
+              style={{ fontVariantNumeric: 'tabular-nums' }}
+            >
+              {simTimeLabel}
+            </div>
+          </div>
 
           <div className="absolute right-6 bottom-6 z-[28] pointer-events-auto flex items-center gap-8">
             <div
@@ -2115,7 +2311,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
                 }}
               >
                 <div style={{ height: DAY_WIDGET_CENTER_PADDING, flexShrink: 0 }} />
-                {Array.from({ length: 31 }, (_, idx) => idx + 1).map((d) => (
+                {Array.from({ length: visibleDayCount }, (_, idx) => idx + 1).map((d) => (
                   <div
                     key={`tw-day-${d}`}
                     data-day-item="1"

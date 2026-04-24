@@ -7,12 +7,74 @@ interface BackgroundShaderProps {
   precipitation?: number;
   dayPhase?: SunnyDayPhase;
   sunIntensity?: number;
+  ledMode?: boolean;
+  isActive?: boolean;
+  onFpsUpdate?: (fps: number) => void;
+}
+
+function getBackgroundRenderScale(weatherCondition: BackgroundShaderProps['weatherCondition']) {
+  if (weatherCondition === 'Cloudy') return 0.46;
+  if (weatherCondition === 'Rainy') return 0.72;
+  return 1;
+}
+
+function easeInOutCubic(t: number) {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 }
 
 const vertexShaderSource = `
   attribute vec2 a_position;
   void main() {
       gl_Position = vec4(a_position, 0.0, 1.0);
+  }
+`;
+
+const ledTransitionShaderChunk = `
+  uniform float u_transition;
+
+  float ledPixelSize() {
+    return u_resolution.y / 108.0;
+  }
+
+  vec2 getTransitionFragCoord(vec2 fragCoord) {
+    float pixelSize = ledPixelSize();
+    vec2 gridCoord = fragCoord / pixelSize;
+    vec2 pixelCenter = (floor(gridCoord) + 0.5) * pixelSize;
+    return mix(fragCoord, pixelCenter, u_transition);
+  }
+
+  vec3 applyLedTransition(vec3 baseColor, vec2 fragCoord) {
+    float pixelSize = ledPixelSize();
+    vec2 gridCoord = fragCoord / pixelSize;
+    vec2 localPos = fract(gridCoord) - 0.5;
+    vec2 diodePos = localPos * vec2(0.9, 1.08);
+    float diodeDist = length(diodePos);
+
+    float ledMask = smoothstep(0.50, 0.16, diodeDist);
+    float ledGlow = smoothstep(0.62, 0.0, diodeDist) * 0.12;
+    float finalMask = mix(1.0, 0.22 + ledMask * 0.78, u_transition);
+    float finalGlow = mix(0.0, ledGlow, u_transition);
+
+    vec3 litColor = baseColor * mix(1.0, 1.06, u_transition);
+    vec3 bgColor = vec3(0.05, 0.055, 0.07);
+    vec3 diodeFloor = mix(baseColor * 0.94, bgColor + baseColor * 0.1, u_transition);
+    vec3 finalColor = mix(diodeFloor, litColor * (0.96 + finalGlow), finalMask);
+
+    // Prevent highlight channel clipping from washing hues to white in LED mode.
+    // (If values exceed 1.0, scale down proportionally to preserve chroma.)
+    if (u_transition > 0.001) {
+      float maxC = max(finalColor.r, max(finalColor.g, finalColor.b));
+      if (maxC > 1.0) finalColor /= maxC;
+    }
+
+    vec2 uv = fragCoord / u_resolution.xy;
+    float vignette = uv.x * uv.y * (1.0 - uv.x) * (1.0 - uv.y);
+    vignette = clamp(pow(16.0 * vignette, 0.2), 0.0, 1.0);
+    finalColor *= mix(1.0, 0.92 + vignette * 0.08, u_transition);
+
+    return finalColor;
   }
 `;
 
@@ -24,6 +86,7 @@ const rainyFragmentShaderSource = `
   uniform vec2 u_mouse;
   uniform float u_precipitation;
   uniform float u_visibility;
+  ${ledTransitionShaderChunk}
 
   #define iResolution vec3(u_resolution, 1.0)
   #define iTime u_time
@@ -246,7 +309,9 @@ const rainyFragmentShaderSource = `
 
   void main() {
       vec4 fragColor = vec4(0.0);
-      mainImage(fragColor, gl_FragCoord.xy);
+      vec2 fragCoord = getTransitionFragCoord(gl_FragCoord.xy);
+      mainImage(fragColor, fragCoord);
+      fragColor.rgb = applyLedTransition(fragColor.rgb, gl_FragCoord.xy);
       gl_FragColor = fragColor;
   }
 `;
@@ -259,6 +324,7 @@ const cloudyFragmentShaderSource = `
   uniform vec2 u_mouse;
   uniform float u_precipitation;
   uniform float u_visibility;
+  ${ledTransitionShaderChunk}
 
   #define iResolution u_resolution
   #define iTime u_time
@@ -380,22 +446,7 @@ const cloudyFragmentShaderSource = `
       vec4 sum = vec4(0.0);    
       float t = 0.05*fract(sin(dot(px, vec2(12.9898, 78.233))) * 43758.5453);    
       
-      for(int i=0; i<30; i++) {
-          vec3 pos = ro + t*rd;
-          if( pos.y<-3.0 || pos.y>2.0 || sum.a>0.99 ) break;
-          float den = map5( pos );
-          if( den>0.01 ) {
-              float dif = clamp((den - map5(pos+0.3*sundir))/0.6, 0.0, 1.0 );
-              vec3 lin = vec3(1.0,0.6,0.3)*dif+vec3(0.91,0.98,1.05);
-              vec4 col = vec4( mix( vec3(1.0,0.95,0.8), vec3(0.25,0.3,0.35), den ), den );
-              col.xyz *= lin;
-              // Fog removed
-              col.w *= 0.4; col.rgb *= col.a;
-              sum += col*(1.0-sum.a);
-          }
-          t += max(0.06,0.05*t);
-      }
-      for(int i=0; i<30; i++) {
+      for(int i=0; i<18; i++) {
           vec3 pos = ro + t*rd;
           if( pos.y<-3.0 || pos.y>2.0 || sum.a>0.99 ) break;
           float den = map4( pos );
@@ -408,7 +459,22 @@ const cloudyFragmentShaderSource = `
               col.w *= 0.4; col.rgb *= col.a;
               sum += col*(1.0-sum.a);
           }
-          t += max(0.06,0.05*t);
+          t += max(0.09,0.07*t);
+      }
+      for(int i=0; i<10; i++) {
+          vec3 pos = ro + t*rd;
+          if( pos.y<-3.0 || pos.y>2.0 || sum.a>0.99 ) break;
+          float den = map2( pos );
+          if( den>0.01 ) {
+              float dif = clamp((den - map2(pos+0.3*sundir))/0.6, 0.0, 1.0 );
+              vec3 lin = vec3(1.0,0.6,0.3)*dif+vec3(0.91,0.98,1.05);
+              vec4 col = vec4( mix( vec3(1.0,0.95,0.8), vec3(0.25,0.3,0.35), den ), den );
+              col.xyz *= lin;
+              // Fog removed
+              col.w *= 0.4; col.rgb *= col.a;
+              sum += col*(1.0-sum.a);
+          }
+          t += max(0.12,0.09*t);
       }
       return clamp( sum, 0.0, 1.0 );
   }
@@ -425,14 +491,17 @@ const cloudyFragmentShaderSource = `
   #endif
 
   void main() {
-      vec2 p = (2.0*gl_FragCoord.xy-iResolution.xy)/iResolution.y;
+      vec2 fragCoord = getTransitionFragCoord(gl_FragCoord.xy);
+      vec2 p = (2.0*fragCoord-iResolution.xy)/iResolution.y;
       vec2 m = iMouse.xy/iResolution.xy;
       vec3 ro = 4.0*normalize(vec3(sin(3.0*m.x), 0.8*m.y, cos(3.0*m.x))) - vec3(0.0,0.1,0.0);
       vec3 ta = vec3(0.0, -1.0, 0.0);
       mat3 ca = setCamera( ro, ta, 0.07*cos(0.25*iTime) );
       vec3 rd = ca * normalize( vec3(p.xy,1.5));
       
-      gl_FragColor = render( ro, rd, gl_FragCoord.xy );
+      vec4 color = render( ro, rd, fragCoord );
+      color.rgb = applyLedTransition(color.rgb, gl_FragCoord.xy);
+      gl_FragColor = color;
   }
 `;
 
@@ -442,6 +511,7 @@ const sunnyFragmentShaderSource = `
   uniform float u_time;
   uniform float u_day_phase;
   uniform float u_intensity;
+  ${ledTransitionShaderChunk}
 
   #define PI 3.141592653589793
 
@@ -500,7 +570,8 @@ const sunnyFragmentShaderSource = `
   }
 
   void main() {
-    vec2 uv = gl_FragCoord.xy / u_resolution.xy;
+    vec2 fragCoord = getTransitionFragCoord(gl_FragCoord.xy);
+    vec2 uv = fragCoord / u_resolution.xy;
     vec2 centered = uv - 0.5;
     centered.x *= u_resolution.x / u_resolution.y;
 
@@ -557,6 +628,7 @@ const sunnyFragmentShaderSource = `
     float vig = smoothstep(1.2, 0.4, length(centered));
     color *= 0.8 + 0.2 * vig;
 
+    color = applyLedTransition(color, gl_FragCoord.xy);
     gl_FragColor = vec4(color, 1.0);
   }
 `
@@ -566,14 +638,27 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
   weatherCondition = 'Rainy',
   precipitation = 80,
   dayPhase = 'noon',
-  sunIntensity = 70
+  sunIntensity = 70,
+  ledMode = false,
+  isActive = true,
+  onFpsUpdate,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const propsRef = useRef({ precipitation, dayPhase, sunIntensity });
+  const propsRef = useRef({ precipitation, dayPhase, sunIntensity, ledMode });
+  const fpsUpdateRef = useRef(onFpsUpdate);
 
   useEffect(() => {
-    propsRef.current = { precipitation, dayPhase, sunIntensity };
-  }, [precipitation, dayPhase, sunIntensity]);
+    propsRef.current = { precipitation, dayPhase, sunIntensity, ledMode };
+  }, [precipitation, dayPhase, sunIntensity, ledMode]);
+
+  useEffect(() => {
+    fpsUpdateRef.current = onFpsUpdate;
+  }, [onFpsUpdate]);
+
+  useEffect(() => {
+    if (isActive) return;
+    fpsUpdateRef.current?.(0);
+  }, [isActive]);
 
   const phaseToValue = (phase: SunnyDayPhase) => {
     switch (phase) {
@@ -586,8 +671,11 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
   };
 
   useEffect(() => {
+    if (!isActive) return;
+
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const renderScale = getBackgroundRenderScale(weatherCondition);
     const gl =
       (canvas.getContext('webgl') as WebGLRenderingContext | null) ||
       (canvas.getContext('experimental-webgl') as WebGLRenderingContext | null);
@@ -652,10 +740,13 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
     const timeLocation = gl.getUniformLocation(program, 'u_time');
     const mouseLocation = gl.getUniformLocation(program, 'u_mouse');
     const precipitationLocation = gl.getUniformLocation(program, 'u_precipitation');
+    const dayPhaseLocation = gl.getUniformLocation(program, 'u_day_phase');
+    const intensityLocation = gl.getUniformLocation(program, 'u_intensity');
+    const transitionLocation = gl.getUniformLocation(program, 'u_transition');
 
     const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      canvas.width = Math.max(1, Math.round(window.innerWidth * renderScale));
+      canvas.height = Math.max(1, Math.round(window.innerHeight * renderScale));
       gl.viewport(0, 0, canvas.width, canvas.height);
     };
     window.addEventListener('resize', resize);
@@ -663,19 +754,41 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
 
     let animationFrameId: number;
     const startTime = Date.now();
+    let currentTransition = propsRef.current.ledMode ? 1.0 : 0.0;
+    let transitionTarget = currentTransition;
+    let transitionStartValue = currentTransition;
+    let transitionStartedAt = performance.now();
+    let fpsFrames = 0;
+    let fpsSampleStartedAt = performance.now();
+    const transitionDurationMs = 1200;
 
     const render = () => {
       const currentTime = (Date.now() - startTime) / 1000.0;
+      const now = performance.now();
+      const nextTarget = propsRef.current.ledMode ? 1.0 : 0.0;
+      if (nextTarget !== transitionTarget) {
+        transitionStartValue = currentTransition;
+        transitionTarget = nextTarget;
+        transitionStartedAt = now;
+      }
+      const transitionProgress = Math.min((now - transitionStartedAt) / transitionDurationMs, 1);
+      currentTransition = transitionStartValue + (transitionTarget - transitionStartValue) * easeInOutCubic(transitionProgress);
+      fpsFrames += 1;
+
+      if (now - fpsSampleStartedAt >= 250) {
+        const sampledFps = (fpsFrames * 1000) / Math.max(now - fpsSampleStartedAt, 1);
+        fpsUpdateRef.current?.(Math.round(sampledFps));
+        fpsFrames = 0;
+        fpsSampleStartedAt = now;
+      }
       
       gl.uniform2f(resolutionLocation, canvas.width, canvas.height);
       gl.uniform1f(timeLocation, currentTime);
       gl.uniform2f(mouseLocation, 0, 0);
       gl.uniform1f(precipitationLocation, propsRef.current.precipitation / 100.0);
-
-      const dayPhaseLocation = gl.getUniformLocation(program, 'u_day_phase');
-      const intensityLocation = gl.getUniformLocation(program, 'u_intensity');
       if (dayPhaseLocation) gl.uniform1f(dayPhaseLocation, phaseToValue(propsRef.current.dayPhase));
       if (intensityLocation) gl.uniform1f(intensityLocation, propsRef.current.sunIntensity / 100.0);
+      if (transitionLocation) gl.uniform1f(transitionLocation, currentTransition);
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       animationFrameId = requestAnimationFrame(render);
@@ -686,8 +799,9 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
     return () => {
       window.removeEventListener('resize', resize);
       cancelAnimationFrame(animationFrameId);
+      fpsUpdateRef.current?.(0);
     };
-  }, [weatherCondition]);
+  }, [weatherCondition, isActive]);
 
   return (
     <div className="absolute inset-0 z-0 overflow-hidden pointer-events-none bg-[#0A0A0B]">

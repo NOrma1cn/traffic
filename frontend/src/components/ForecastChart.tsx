@@ -272,7 +272,7 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
         </div>
       </div>
 
-      <div className="relative h-[320px] w-full overflow-hidden">
+      <div className="relative h-[400px] w-full overflow-hidden">
         <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-full overflow-visible">
           {[0, 0.25, 0.5, 0.75, 1].map((p, i) => {
             const val = minVal + p * range;

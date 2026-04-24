@@ -1211,6 +1211,51 @@ class CaltransTrafficService:
         span = max(float(median - lower), 1e-6)
         return _clip01((float(median) - float(value)) / span)
 
+    def _congestion_probability(
+        self,
+        *,
+        flow: float,
+        occupancy: float,
+        speed: float,
+        flow_med: float,
+        occ_med: float,
+        speed_med: float,
+        occ_score: float,
+        flow_score: float,
+        speed_score: float,
+        pressure_score: float,
+    ) -> float:
+        occ_pct = float(occupancy) * 100.0
+        occ_med_pct = float(occ_med) * 100.0
+        speed_abs = _clip01((55.0 - float(speed)) / 20.0)
+        occ_abs = _clip01((occ_pct - 8.0) / 14.0)
+        flow_abs = _clip01((float(flow) - float(flow_med)) / max(float(flow_med) * 0.45, 12.0))
+        occ_delta = _clip01((occ_pct - occ_med_pct) / max(8.0, occ_med_pct * 0.6))
+        speed_delta = _clip01((float(speed_med) - float(speed)) / max(12.0, float(speed_med) * 0.25))
+
+        z = (
+            -2.2
+            + 1.9 * speed_abs
+            + 1.6 * occ_abs
+            + 1.3 * occ_score
+            + 1.0 * speed_score
+            + 0.6 * flow_score
+            + 0.5 * pressure_score
+            + 0.6 * occ_delta
+            + 0.4 * speed_delta
+            + 0.2 * flow_abs
+        )
+
+        if speed <= 45.0 and occ_pct >= 12.0:
+            z += 0.7
+        if speed <= 35.0 or occ_pct >= 20.0:
+            z += 0.9
+        if speed >= 62.0 and occ_pct <= 7.0:
+            z -= 0.9
+
+        probability = 1.0 / (1.0 + math.exp(-float(np.clip(z, -8.0, 8.0))))
+        return float(np.clip(probability, 0.0, 1.0))
+
     def _risk_from_state(self, *, sensor: int, idx: int, flow: float, occupancy: float, speed: float) -> dict:
         day_type = self._day_type_index(idx)
         slot = self._slot_index(idx)
@@ -1235,6 +1280,18 @@ class CaltransTrafficService:
             combined *= 0.5
 
         score = float(np.clip(combined, 0.0, 1.0))
+        probability = self._congestion_probability(
+            flow=flow,
+            occupancy=occupancy,
+            speed=speed,
+            flow_med=flow_med,
+            occ_med=occ_med,
+            speed_med=speed_med,
+            occ_score=occ_score,
+            flow_score=flow_score,
+            speed_score=speed_score,
+            pressure_score=pressure_score,
+        )
         if score >= 0.8:
             level = "severe"
         elif score >= 0.6:
@@ -1246,6 +1303,7 @@ class CaltransTrafficService:
 
         return {
             "score": score,
+            "probability": probability,
             "level": level,
             "components": {
                 "occupancy": float(occ_score),
@@ -1322,6 +1380,7 @@ class CaltransTrafficService:
             "speed_mph": _round(speed, 2),
             "speed_kmh": _round(speed * MPH_TO_KMH, 2),
             "congestion_score": _round(risk["score"], 3),
+            "congestion_probability": _round(risk["probability"], 3),
             "congestion_level": risk["level"],
             "baseline_flow_veh_5min": _round(risk["baseline"]["flow"], 1),
             "baseline_occupancy_pct": _round(risk["baseline"]["occupancy"] * 100.0, 2),
@@ -1651,6 +1710,7 @@ class CaltransTrafficService:
             "baseline_occupancy_pct": _round(current_risk["baseline"]["occupancy"] * 100.0, 2),
             "baseline_speed_kmh": _round(current_risk["baseline"]["speed"] * MPH_TO_KMH, 2),
             "congestion_score": _round(current_risk["score"], 3),
+            "congestion_probability": _round(current_risk["probability"], 3),
             "congestion_level": current_risk["level"],
             "components": {k: _round(v, 3) for k, v in current_risk["components"].items()},
         }
@@ -1685,7 +1745,7 @@ class CaltransTrafficService:
                 "flow_veh_5min": _round(sflow, 1), "occupancy_pct": _round(socc * 100.0, 2), "speed_kmh": _round(sspeed * MPH_TO_KMH, 2),
                 "delta_speed_kmh": _round(sspeed * MPH_TO_KMH - current_packet["speed_kmh"], 2),
                 "delta_occupancy_pct": _round(socc * 100.0 - current_packet["occupancy_pct"], 2),
-                "congestion_score": _round(srisk["score"], 3), "congestion_level": srisk["level"],
+                "congestion_score": _round(srisk["score"], 3), "congestion_probability": _round(srisk["probability"], 3), "congestion_level": srisk["level"],
             })
 
         incident_scenarios = []
@@ -1699,7 +1759,7 @@ class CaltransTrafficService:
                 "flow_veh_5min": _round(sflow, 1), "occupancy_pct": _round(socc * 100.0, 2), "speed_kmh": _round(sspeed * MPH_TO_KMH, 2),
                 "delta_speed_kmh": _round(sspeed * MPH_TO_KMH - current_packet["speed_kmh"], 2),
                 "delta_occupancy_pct": _round(socc * 100.0 - current_packet["occupancy_pct"], 2),
-                "congestion_score": _round(srisk["score"], 3), "congestion_level": srisk["level"],
+                "congestion_score": _round(srisk["score"], 3), "congestion_probability": _round(srisk["probability"], 3), "congestion_level": srisk["level"],
             })
 
         confidence = self._build_confidence(current_risk=current_risk, windows=windows, station_idx=sensor)
@@ -1726,9 +1786,23 @@ class CaltransTrafficService:
                 )
                 for idx in hist_idx
             ],
+            "congestion_probability": [
+                _round(
+                    self._risk_from_state(
+                        sensor=sensor,
+                        idx=int(idx),
+                        flow=float(self.flow_raw[idx, sensor]),
+                        occupancy=float(self.occupancy_raw[idx, sensor]),
+                        speed=float(self.speed_raw[idx, sensor]),
+                    )["probability"],
+                    3,
+                )
+                for idx in hist_idx
+            ],
         }
 
         pred_scores_sensor = []
+        pred_probs_sensor = []
         pred_levels_sensor = []
         for h in range(self.out_horizon):
             risk = self._risk_from_state(
@@ -1739,6 +1813,7 @@ class CaltransTrafficService:
                 speed=float(pred[sensor, h, 2]),
             )
             pred_scores_sensor.append(_round(risk["score"], 3))
+            pred_probs_sensor.append(_round(risk["probability"], 3))
             pred_levels_sensor.append(risk["level"])
 
         prediction_series = {
@@ -1747,6 +1822,7 @@ class CaltransTrafficService:
             "occupancy_pct": [_round(v * 100.0, 2) for v in pred[sensor, :, 1]],
             "speed_kmh": [_round(v * MPH_TO_KMH, 2) for v in pred[sensor, :, 2]],
             "risk_score": pred_scores_sensor,
+            "congestion_probability": pred_probs_sensor,
             "risk_level": pred_levels_sensor,
         }
 
@@ -1787,6 +1863,19 @@ class CaltransTrafficService:
                                 occupancy=float(self.occupancy_raw[int(ii), sensor]),
                                 speed=float(self.speed_raw[int(ii), sensor]),
                             )["score"],
+                            3,
+                        )
+                        for ii in idx
+                    ],
+                    "congestion_probability": [
+                        _round(
+                            self._risk_from_state(
+                                sensor=sensor,
+                                idx=int(ii),
+                                flow=float(self.flow_raw[int(ii), sensor]),
+                                occupancy=float(self.occupancy_raw[int(ii), sensor]),
+                                speed=float(self.speed_raw[int(ii), sensor]),
+                            )["probability"],
                             3,
                         )
                         for ii in idx
@@ -1874,11 +1963,13 @@ class CaltransTrafficService:
             "incident_scenarios": incident_scenarios,
             "congestion_summary": {
                 "current_level": current_packet["congestion_level"],
+                "current_probability": current_packet["congestion_probability"],
                 "peak_window": peak_key,
                 "peak_minutes_ahead": int(windows[peak_key]["minutes_ahead"]),
                 "peak_level": windows[peak_key]["congestion_level"],
                 "peak_score": _round(float(windows[peak_key]["congestion_score"]), 3),
-                "headline": f"{windows[peak_key]['minutes_ahead']} 分钟窗口风险最高",
+                "peak_probability": _round(float(windows[peak_key]["congestion_probability"]), 3),
+                "headline": f"{windows[peak_key]['minutes_ahead']} 分钟窗口拥堵概率最高",
             },
             "global_state": {
                 "pred_levels": peak_levels.astype(int).tolist(),

@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Weather Flow Widget</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    body {
+      background-color: transparent;
+      margin: 0;
+      color: white;
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      background: radial-gradient(circle at center, #1a1c23 0%, #000000 100%);
+    }
+    
+    .widget-container {
+      position: relative;
+      background: #0B0D14;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 1rem;
+      width: 850px;
+      height: 460px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 1.5rem 0.5rem;
+      overflow: hidden;
+      cursor: default;
+    }
+
+    .node-col {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-around;
+      height: 100%;
+      width: 140px;
+      z-index: 3;
+      transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+      opacity: 0;
+    }
+
+    .left-col { transform: translateX(-20px); }
+    .right-col { transform: translateX(20px); }
+
+    .widget-container:hover .left-col { opacity: 1; transform: translateX(0); }
+    .widget-container:hover .right-col { opacity: 1; transform: translateX(0); }
+
+    .center-node {
+      position: relative;
+      z-index: 4;
+      flex-shrink: 0;
+      width: 14rem;
+      height: 14rem;
+      border-radius: 50%;
+      background: rgba(11, 13, 20, 0.8);
+      box-shadow: 0 0 40px rgba(0,0,0,0.5);
+      backdrop-filter: blur(12px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transform: scale(0.9);
+      transition: transform 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .widget-container:hover .center-node {
+      transform: scale(1);
+    }
+
+    .icon-container {
+      width: 8rem;
+      height: 8rem;
+      color: white;
+      filter: drop-shadow(0 0 40px rgba(255,255,255,0.5));
+      animation: pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: .7; }
+    }
+
+    .data-card {
+      padding: 0.5rem 1rem;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(255,255,255,0.05);
+      backdrop-filter: blur(12px);
+      border-radius: 0.75rem;
+      transition: all 0.3s;
+      position: relative;
+    }
+    .data-card:hover {
+      background: rgba(255,255,255,0.05);
+    }
+
+    .left-card { text-align: right; align-items: flex-end; direction: rtl; }
+    .left-card .card-content { direction: ltr; }
+    .right-card { text-align: left; align-items: flex-start; }
+
+    .svg-layer {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 2;
+      pointer-events: none;
+      mix-blend-mode: screen;
+    }
+
+    path {
+      opacity: 0;
+      transition: opacity 0.6s linear;
+    }
+    
+    .widget-container:hover path {
+      opacity: 1;
+    }
+    
+    .bg-title {
+      position: absolute;
+      top: 2rem;
+      width: 100%;
+      text-align: center;
+      font-weight: 900;
+      text-transform: uppercase;
+      letter-spacing: 0.2em;
+      color: rgba(255,255,255,0.04);
+      font-size: 32px;
+      z-index: 0;
+      pointer-events: none;
+      user-select: none;
+    }
+    
+    .dashed-circle {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 400px;
+      height: 400px;
+      border: 1px dashed rgba(255,255,255,0.1);
+      border-radius: 50%;
+      pointer-events: none;
+      z-index: 1;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="widget-container" id="widget">
+    <div class="bg-title">气象拓扑流量</div>
+    <div class="dashed-circle"></div>
+    
+    <svg class="svg-layer" id="svg-layer">
+      <defs id="svg-defs"></defs>
+      <g id="svg-paths"></g>
+    </svg>
+
+    <div class="node-col left-col" id="left-col"></div>
+
+    <div class="center-node" id="center-node">
+      <div class="icon-container">
+        <i data-lucide="cloud-sun" style="width: 100%; height: 100%; stroke-width: 1.75;"></i>
+      </div>
+    </div>
+
+    <div class="node-col right-col" id="right-col"></div>
+  </div>
+
+  <script>
+    const leftData = [
+      { id: 'w_temp', title: '环境温度', value: '18.0°C', sub: '环境', icon: 'thermometer', thick: 20, colors: ['#3b82f6', '#60a5fa'] },
+      { id: 'w_hum', title: '相对湿度', value: '70%', sub: '相对值', icon: 'droplets', thick: 25, colors: ['#10b981', '#34d399'] },
+      { id: 'w_cloud', title: '云层遮蔽', value: '70%', sub: '遮蔽度', icon: 'cloud', thick: 25, colors: ['#6366f1', '#818cf8'] },
+      { id: 'w_vis', title: '能见度', value: '6.0km', sub: '视距范围', icon: 'eye', thick: 30, colors: ['#f59e0b', '#fbbf24'] }
+    ];
+
+    const rightData = [
+      { id: 'w_wind', title: '实时风速', value: '18.0km/h', sub: '风量', icon: 'wind', thick: 25, colors: ['#ec4899', '#f472b6'] },
+      { id: 'w_precip', title: '降水量', value: '1.50mm', sub: '强度', icon: 'cloud-rain', thick: 22, colors: ['#ef4444', '#f87171'] },
+      { id: 'w_prob', title: '降水概率', value: '45%', sub: '预测', icon: 'percent', thick: 15, colors: ['#8b5cf6', '#a78bfa'] },
+      { id: 'w_eta', title: '气象切换', value: '15m', sub: '即将到来', icon: 'clock', thick: 20, colors: ['#14b8a6', '#2dd4bf'] }
+    ];
+
+    function createCard(data, isLeft) {
+      if (isLeft) {
+        return `
+          <div class="data-card left-card flex flex-col group" id="card-${data.id}">
+            <div class="flex items-center gap-2 mb-1.5 opacity-85 card-content justify-end" style="direction: ltr;">
+              <div class="text-[9px] text-zinc-200 font-bold uppercase tracking-wider">${data.title}</div>
+              <i data-lucide="${data.icon}" class="w-3.5 h-3.5 text-zinc-400"></i>
+            </div>
+            <div class="text-2xl font-black text-white tracking-tighter leading-none card-content" style="direction: ltr;">${data.value}</div>
+            <div class="text-[8px] text-zinc-400 font-bold mt-1.5 uppercase tracking-wider card-content" style="direction: ltr;">${data.sub}</div>
+          </div>
+        `;
+      } else {
+        return `
+          <div class="data-card right-card flex flex-col group" id="card-${data.id}">
+            <div class="flex items-center gap-2 mb-1.5 opacity-85 w-full justify-start">
+              <i data-lucide="${data.icon}" class="w-3.5 h-3.5 text-zinc-400"></i>
+              <div class="text-[9px] text-zinc-200 font-bold uppercase tracking-wider">${data.title}</div>
+            </div>
+            <div class="text-2xl font-black text-white tracking-tighter leading-none">${data.value}</div>
+            <div class="text-[8px] text-zinc-500 font-bold mt-1.5 uppercase tracking-widest">${data.sub}</div>
+          </div>
+        `;
+      }
+    }
+
+    document.getElementById('left-col').innerHTML = leftData.map(d => createCard(d, true)).join('');
+    document.getElementById('right-col').innerHTML = rightData.map(d => createCard(d, false)).join('');
+    lucide.createIcons();
+
+    const widget = document.getElementById('widget');
+    const svgDefs = document.getElementById('svg-defs');
+    const svgPaths = document.getElementById('svg-paths');
+    const centerNode = document.getElementById('center-node');
+
+    let pathsData = [];
+    let isHovered = false;
+    let resizeTimer;
+
+    function buildPaths() {
+      svgDefs.innerHTML = '';
+      svgPaths.innerHTML = '';
+      pathsData = [];
+
+      const widgetRect = widget.getBoundingClientRect();
+      const centerRect = centerNode.getBoundingClientRect();
+      
+      const cLeftX = centerRect.left - widgetRect.left;
+      const cRightX = centerRect.right - widgetRect.left;
+      
+      const CENTER_SIZE = 224; 
+      const JUNCTION_RATIO = 0.9;
+      
+      const cLeftTop = (centerRect.top - widgetRect.top) + (CENTER_SIZE * (1 - JUNCTION_RATIO) / 2);
+      const centerHeight = CENTER_SIZE * JUNCTION_RATIO;
+      
+      const scaleL = Math.min((centerHeight * 0.95) / leftData.reduce((s, d) => s + d.thick, 0), 1);
+      const totalThickL = leftData.reduce((s, d) => s + d.thick, 0) * scaleL;
+      let currYLeft = cLeftTop + (centerHeight - totalThickL) / 2;
+
+      leftData.forEach((d) => {
+        const card = document.getElementById(`card-${d.id}`);
+        let current = card;
+        let leftOffsetX = 0;
+        let topOffsetY = 0;
+        while(current && current !== widget) {
+          leftOffsetX += current.offsetLeft;
+          topOffsetY += current.offsetTop;
+          current = current.offsetParent;
+        }
+        
+        const startX = leftOffsetX + card.offsetWidth;
+        const startY = topOffsetY + card.offsetHeight / 2;
+        const thick = d.thick * scaleL;
+        
+        createPathEl(d.id, startX, startY, cLeftX, currYLeft, thick, false, d.colors);
+        currYLeft += thick;
+      });
+
+      const scaleR = Math.min((centerHeight * 0.95) / rightData.reduce((s, d) => s + d.thick, 0), 1);
+      const totalThickR = rightData.reduce((s, d) => s + d.thick, 0) * scaleR;
+      let currYRight = cLeftTop + (centerHeight - totalThickR) / 2;
+
+      rightData.forEach((d) => {
+        const card = document.getElementById(`card-${d.id}`);
+        let current = card;
+        let leftOffsetX = 0;
+        let topOffsetY = 0;
+        while(current && current !== widget) {
+          leftOffsetX += current.offsetLeft;
+          topOffsetY += current.offsetTop;
+          current = current.offsetParent;
+        }
+        
+        const startX = leftOffsetX;
+        const startY = topOffsetY + card.offsetHeight / 2;
+        const thick = d.thick * scaleR;
+        
+        createPathEl(d.id, startX, startY, cRightX, currYRight, thick, true, d.colors);
+        currYRight += thick;
+      });
+    }
+
+    function createPathEl(id, startX, startY, endX, endTopY, thick, isRight, colors) {
+      const gradId = `grad-${id}`;
+      const def = document.createElementNS('http://www.w3.org/2000/svg', 'linearGradient');
+      def.setAttribute('id', gradId);
+      def.setAttribute('x1', '0%');
+      def.setAttribute('y1', '0%');
+      def.setAttribute('x2', '100%');
+      def.setAttribute('y2', '0%');
+      
+      if (!isRight) {
+        def.innerHTML = `<stop offset="0%" stop-color="${colors[0]}" stop-opacity="0.9"/><stop offset="100%" stop-color="${colors[1]}" stop-opacity="0.4"/>`;
+      } else {
+        def.innerHTML = `<stop offset="0%" stop-color="${colors[0]}" stop-opacity="0.4"/><stop offset="100%" stop-color="${colors[1]}" stop-opacity="0.9"/>`;
+      }
+      svgDefs.appendChild(def);
+
+      const offset = Math.abs(endX - startX) * 0.5;
+      const cp1X = isRight ? startX - offset : startX + offset;
+      const cp2X = isRight ? endX + offset : endX - offset;
+      const endBottomY = endTopY + thick;
+
+      const fullD = `M ${startX} ${startY - thick / 2} C ${cp1X} ${startY - thick / 2}, ${cp2X} ${endTopY}, ${endX} ${endTopY} L ${endX} ${endBottomY} C ${cp2X} ${endBottomY}, ${cp1X} ${startY + thick / 2}, ${startX} ${startY + thick / 2} Z`;
+      const collD = `M ${endX} ${endTopY + thick / 2} C ${endX} ${endTopY + thick / 2}, ${endX} ${endTopY}, ${endX} ${endTopY} L ${endX} ${endBottomY} C ${endX} ${endBottomY}, ${endX} ${endTopY + thick / 2}, ${endX} ${endTopY + thick / 2} Z`;
+
+      const tFull = fullD.replace(/\s+/g, ' ').trim();
+      const tColl = collD.replace(/\s+/g, ' ').trim();
+
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('fill', `url(#${gradId})`);
+      path.setAttribute('d', tColl);
+      
+      svgPaths.appendChild(path);
+      
+      pathsData.push({ path, tFull, tColl });
+    }
+
+    function extractNumbers(str) { return str.match(/-?\d*\.?\d+/g).map(Number); }
+    
+    let animReq;
+    let animT = 0;
+    
+    function animatePaths(target) {
+      cancelAnimationFrame(animReq);
+      
+      function tick() {
+        if (Math.abs(animT - target) < 0.01) {
+          animT = target;
+          pathsData.forEach(p => p.path.setAttribute('d', target === 1 ? p.tFull : p.tColl));
+          return;
+        }
+        
+        animT += (target - animT) * 0.08;
+        
+        pathsData.forEach(p => {
+          const n1 = extractNumbers(p.tColl);
+          const n2 = extractNumbers(p.tFull);
+          let idx = 0;
+          const newD = p.tColl.replace(/-?\d*\.?\d+/g, () => {
+            const v = n1[idx] + (n2[idx] - n1[idx]) * animT;
+            idx++;
+            return v.toFixed(3);
+          });
+          p.path.setAttribute('d', newD);
+        });
+        
+        animReq = requestAnimationFrame(tick);
+      }
+      tick();
+    }
+
+    widget.addEventListener('mouseenter', () => {
+      isHovered = true;
+      animatePaths(1);
+    });
+
+    widget.addEventListener('mouseleave', () => {
+      isHovered = false;
+      animatePaths(0);
+    });
+
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        buildPaths();
+      }, 50);
+    });
+    
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        buildPaths();
+        animT = isHovered ? 1 : 0;
+        pathsData.forEach(p => p.path.setAttribute('d', isHovered ? p.tFull : p.tColl));
+      }, 100);
+    });
+  </script>
+</body>
+</html>
