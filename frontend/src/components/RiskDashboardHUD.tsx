@@ -49,6 +49,12 @@ const RiskDashboardHUD: React.FC<RiskDashboardHUDProps> = ({
     { key: 'occupancy' as const, ...metrics.occupancy, x: 867, y: 257, r: 50, icon: <Wind size={18} /> },
   ], [metrics]);
 
+  const labelArcAngles = {
+    speed: { start: 202, end: 292, sweep: 1 },
+    flow: { start: 248, end: 338, sweep: 1 },
+    occupancy: { start: 98, end: 8, sweep: 0 },
+  } as const;
+
   // Derived Values
   const totalRisk = riskScore * 10;
   const riskStatus = totalRisk > 7 ? 'Critical' : totalRisk > 4 ? 'Alert' : 'Stable';
@@ -144,9 +150,27 @@ const RiskDashboardHUD: React.FC<RiskDashboardHUDProps> = ({
             {/* METRIC RINGS */}
             {ringConfigs.map((cfg) => {
               const isSelected = selectedMetric === cfg.key;
+              const labelRadius = cfg.r + 12;
+              const labelArc = labelArcAngles[cfg.key];
+              const labelStart = {
+                x: cfg.x + labelRadius * Math.cos((labelArc.start * Math.PI) / 180),
+                y: cfg.y + labelRadius * Math.sin((labelArc.start * Math.PI) / 180),
+              };
+              const labelEnd = {
+                x: cfg.x + labelRadius * Math.cos((labelArc.end * Math.PI) / 180),
+                y: cfg.y + labelRadius * Math.sin((labelArc.end * Math.PI) / 180),
+              };
+              const labelPathId = `metric-label-arc-${cfg.key}`;
 
               return (
                 <g key={cfg.key} className="cursor-pointer" onClick={() => onMetricSelect(cfg.key)}>
+                  <defs>
+                    <path
+                      id={labelPathId}
+                      d={`M ${labelStart.x} ${labelStart.y} A ${labelRadius} ${labelRadius} 0 0 ${labelArc.sweep} ${labelEnd.x} ${labelEnd.y}`}
+                    />
+                  </defs>
+
                   {/* Background Glow */}
                   <circle
                     cx={cfg.x}
@@ -218,6 +242,16 @@ const RiskDashboardHUD: React.FC<RiskDashboardHUDProps> = ({
                     );
                   })()}
 
+                  {/* Ring Label */}
+                  <text
+                    className="pointer-events-none fill-white text-[14px] font-medium tracking-[0.26em]"
+                    opacity={isSelected ? 1 : 0.86}
+                  >
+                    <textPath href={`#${labelPathId}`} startOffset="50%" textAnchor="middle">
+                      {cfg.label}
+                    </textPath>
+                  </text>
+
                   {/* Metric Metadata */}
                   <foreignObject
                     x={cfg.x - cfg.r}
@@ -225,18 +259,15 @@ const RiskDashboardHUD: React.FC<RiskDashboardHUDProps> = ({
                     width={cfg.r * 2}
                     height={cfg.r * 2}
                   >
-                    <div className="w-full h-full flex flex-col items-center justify-center text-center p-2">
-                       <div className={`transition-transform duration-300 ${isSelected ? 'scale-110' : 'scale-100'}`} style={{ color: cfg.color }}>
-                         {cfg.icon}
-                       </div>
-                       <div className="mt-2">
-                          <div className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider">{cfg.label}</div>
-                          <div className="flex items-baseline justify-center gap-1">
-                            <span className="text-lg font-black text-white leading-none">{(cfg.current).toFixed(1)}</span>
-                            <span className="text-[8px] font-bold text-zinc-500 uppercase">{cfg.unit}</span>
-                          </div>
-                       </div>
-                    </div>
+                     <div className="w-full h-full flex flex-col items-center justify-center text-center p-2">
+                        <div className={`transition-transform duration-300 ${isSelected ? 'scale-110' : 'scale-100'}`} style={{ color: cfg.color }}>
+                          {cfg.icon}
+                        </div>
+                        <div className="mt-2 flex flex-col items-center">
+                           <span className="text-lg font-black text-white leading-none">{(cfg.current).toFixed(1)}</span>
+                           <span className="mt-0.5 text-[8px] font-bold uppercase tracking-wider text-zinc-500">{cfg.unit}</span>
+                        </div>
+                     </div>
                   </foreignObject>
                 </g>
               );

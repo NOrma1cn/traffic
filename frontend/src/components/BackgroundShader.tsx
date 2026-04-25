@@ -35,7 +35,7 @@ const ledTransitionShaderChunk = `
   uniform float u_transition;
 
   float ledPixelSize() {
-    return u_resolution.y / 108.0;
+    return u_resolution.y / 156.0;
   }
 
   vec2 getTransitionFragCoord(vec2 fragCoord) {
@@ -53,11 +53,11 @@ const ledTransitionShaderChunk = `
     float diodeDist = length(diodePos);
 
     float ledMask = smoothstep(0.50, 0.16, diodeDist);
-    float ledGlow = smoothstep(0.62, 0.0, diodeDist) * 0.12;
-    float finalMask = mix(1.0, 0.22 + ledMask * 0.78, u_transition);
+    float ledGlow = smoothstep(0.62, 0.0, diodeDist) * 0.055;
+    float finalMask = mix(1.0, 0.30 + ledMask * 0.62, u_transition);
     float finalGlow = mix(0.0, ledGlow, u_transition);
 
-    vec3 litColor = baseColor * mix(1.0, 1.06, u_transition);
+    vec3 litColor = baseColor * mix(1.0, 0.88, u_transition);
     vec3 bgColor = vec3(0.05, 0.055, 0.07);
     vec3 diodeFloor = mix(baseColor * 0.94, bgColor + baseColor * 0.1, u_transition);
     vec3 finalColor = mix(diodeFloor, litColor * (0.96 + finalGlow), finalMask);
@@ -73,6 +73,7 @@ const ledTransitionShaderChunk = `
     float vignette = uv.x * uv.y * (1.0 - uv.x) * (1.0 - uv.y);
     vignette = clamp(pow(16.0 * vignette, 0.2), 0.0, 1.0);
     finalColor *= mix(1.0, 0.92 + vignette * 0.08, u_transition);
+    finalColor *= mix(1.0, 0.78, u_transition);
 
     return finalColor;
   }
@@ -604,14 +605,9 @@ const sunnyFragmentShaderSource = `
       color += discCol * halo * (0.2 + intensity * 0.25);
       color += discCol * bloom * (0.08 + intensity * 0.15);
     } else {
-      // Moon and stars for midnight
+      // Moon for midnight. Stars are intentionally omitted to avoid square-cell artifacts.
       float moon = circle(centered, sunPos, 0.055, 0.02);
       color += vec3(0.82, 0.88, 1.00) * moon * (0.75 + intensity * 0.2);
-      
-      vec2 starsUv = uv * u_resolution.xy / min(u_resolution.x, u_resolution.y);
-      float stars = step(0.9982, hash21(floor(starsUv * 110.0)));
-      stars *= 0.8 + 0.2 * sin(u_time * 0.8 + starsUv.x * 17.0);
-      color += vec3(0.75, 0.85, 1.0) * stars * 0.6;
     }
 
     // Atmospheric Wisps (Darker, more cinematic clouds)

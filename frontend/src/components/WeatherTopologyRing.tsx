@@ -5,7 +5,8 @@ import type { LucideIcon } from 'lucide-react';
 export interface WeatherRingMetric {
   id: string;
   color: string;
-  icon: LucideIcon;
+  icon?: LucideIcon;
+  iconText?: string;
   value: string;
   title: string;
   progress: number;
@@ -108,6 +109,7 @@ export default function WeatherTopologyRing({
   const currentStartRef = useRef(START_ANGLE);
   const currentSpansRef = useRef(Array.from({ length: blockCount }, () => normalAngle));
   const rafRef = useRef<number | null>(null);
+  const [introComplete, setIntroComplete] = useState(false);
 
   useEffect(() => {
     const nextSpans = Array.from({ length: blockCount }, (_, i) => {
@@ -153,7 +155,9 @@ export default function WeatherTopologyRing({
   }, [activeIndex, blockCount, normalAngle]);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => setIntroComplete(true), 700);
     return () => {
+      window.clearTimeout(timer);
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
     };
   }, []);
@@ -162,7 +166,7 @@ export default function WeatherTopologyRing({
     ? defaultCenter
     : {
         color: metrics[activeIndex].color,
-        icon: metrics[activeIndex].icon,
+        icon: metrics[activeIndex].icon ?? defaultCenter.icon,
         value: metrics[activeIndex].value,
         title: metrics[activeIndex].title,
       };
@@ -250,7 +254,7 @@ export default function WeatherTopologyRing({
           strokeDasharray="18 456"
           initial={{ opacity: 0, rotate: -90 }}
           animate={{ opacity: [0, 0.75, 0], rotate: 250 }}
-          transition={{ duration: 1.35, ease: LOAD_EASE }}
+          transition={{ duration: 0.75, ease: LOAD_EASE }}
           style={{ transformOrigin: `${CX}px ${CY}px` }}
         />
 
@@ -282,7 +286,7 @@ export default function WeatherTopologyRing({
                 opacity={isDimmed ? 0.06 : 0.16 + progress * 0.1}
                 initial={{ opacity: 0, scale: 0.96 }}
                 animate={{ opacity: isDimmed ? 0.06 : 0.16 + progress * 0.1, scale: 1 }}
-                transition={{ duration: 0.55, delay: index * 0.055, ease: LOAD_EASE }}
+                transition={{ duration: introComplete ? 0.16 : 0.32, delay: introComplete ? 0 : index * 0.018, ease: LOAD_EASE }}
                 style={{ transformOrigin: `${CX}px ${CY}px` }}
               />
               {fillPath && (
@@ -291,7 +295,7 @@ export default function WeatherTopologyRing({
                   fill={metric.color}
                   initial={{ opacity: 0, scale: 0.72 }}
                   animate={{ opacity: isDimmed ? 0.32 : 0.82, scale: 1 }}
-                  transition={{ duration: 0.9, delay: 0.16 + index * 0.065, ease: LOAD_EASE }}
+                  transition={{ duration: introComplete ? 0.16 : 0.48, delay: introComplete ? 0 : 0.04 + index * 0.025, ease: LOAD_EASE }}
                   style={{
                     filter: isActive ? `drop-shadow(0 0 12px ${metric.color}C0)` : `drop-shadow(0 0 5px ${metric.color}70)`,
                     transformOrigin: `${CX}px ${CY}px`,
@@ -302,17 +306,28 @@ export default function WeatherTopologyRing({
               <motion.g
                 initial={{ opacity: 0, scale: 0.4 }}
                 animate={{ opacity: isDimmed ? 0.36 : 0.95, scale: 1 }}
-                transition={{ duration: 0.45, delay: 0.32 + index * 0.055, ease: LOAD_EASE }}
+                transition={{ duration: introComplete ? 0.16 : 0.28, delay: introComplete ? 0 : 0.12 + index * 0.02, ease: LOAD_EASE }}
                 style={{ pointerEvents: 'none', transformOrigin: `${iconPoint.x}px ${iconPoint.y}px` }}
               >
-                <MetricIcon
-                  x={iconPoint.x - 8}
-                  y={iconPoint.y - 8}
-                  width={16}
-                  height={16}
-                  color="rgba(255,255,255,0.92)"
-                  strokeWidth={1.9}
-                />
+                {metric.iconText ? (
+                  <text
+                    x={iconPoint.x}
+                    y={iconPoint.y + 5}
+                    textAnchor="middle"
+                    className="fill-white text-[15px] font-black tracking-tight"
+                  >
+                    {metric.iconText}
+                  </text>
+                ) : MetricIcon ? (
+                  <MetricIcon
+                    x={iconPoint.x - 8}
+                    y={iconPoint.y - 8}
+                    width={16}
+                    height={16}
+                    color="rgba(255,255,255,0.92)"
+                    strokeWidth={1.9}
+                  />
+                ) : null}
               </motion.g>
               <path
                 d={hitPath}
@@ -342,7 +357,7 @@ export default function WeatherTopologyRing({
                 opacity={isActive ? 1 : 0.32}
                 initial={{ opacity: 0, scale: 0 }}
                 animate={{ opacity: isActive ? 1 : 0.32, scale: 1 }}
-                transition={{ duration: 0.38, delay: 0.62 + modes.findIndex((item) => item.id === mode.id) * 0.035, ease: LOAD_EASE }}
+                transition={{ duration: introComplete ? 0.12 : 0.24, delay: introComplete ? 0 : 0.22 + modes.findIndex((item) => item.id === mode.id) * 0.018, ease: LOAD_EASE }}
                 style={{
                   cursor: 'pointer',
                   filter: isActive ? `drop-shadow(0 0 10px ${mode.color ?? 'rgba(255,255,255,0.9)'})` : 'none',
@@ -388,8 +403,8 @@ export default function WeatherTopologyRing({
         <motion.div
           className="pointer-events-none flex flex-col items-center"
           initial={{ opacity: 0, scale: 0.82 }}
-          animate={{ opacity: 1, scale: 1, y: [0, -4, 0] }}
-          transition={{ opacity: { duration: 0.5, delay: 0.45 }, scale: { duration: 0.7, delay: 0.45, ease: LOAD_EASE }, y: { duration: 6, ease: 'easeInOut', repeat: Infinity } }}
+          animate={{ opacity: 1, scale: 1 }}
+          transition={{ opacity: { duration: 0.2 }, scale: { duration: 0.36, ease: LOAD_EASE } }}
         >
           <div className="mb-1 transition-colors duration-300" style={{ color: centerData.color ?? 'rgba(255,255,255,0.9)' }}>
             <CenterIcon size={38} strokeWidth={1.5} />

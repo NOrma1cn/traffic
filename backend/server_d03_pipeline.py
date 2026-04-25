@@ -58,6 +58,11 @@ def _round(x: float, n: int = 2) -> float:
     return round(float(x), n)
 
 
+def _wind_cardinal(degrees: float) -> str:
+    sectors = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    return sectors[int(((float(degrees) % 360.0) + 22.5) // 45.0) % len(sectors)]
+
+
 def _clip01(x: float) -> float:
     return float(np.clip(x, 0.0, 1.0))
 
@@ -331,6 +336,7 @@ class CaltransTrafficService:
         self.accident_feat_dim = len(self.accident_feature_names)
         self.accident_features.validate_shape(t_len=self.t_len, n_nodes=self.n_nodes)
         self.accident_features.validate_timestamps(np.load(os.path.join(traffic_dir, "timestamps.npy"), allow_pickle=True))
+        self.accident_events, self.accident_sensor_events = self._load_accident_event_tables(accident_dir)
         
         acc_mean, acc_std = self.accident_features.compute_stats(int(self.t_len * 0.7), self.n_nodes)
         self.accident_feature_mean = acc_mean
@@ -424,6 +430,24 @@ class CaltransTrafficService:
             raise ValueError(f"weather csv missing datetime: {path}")
         df["datetime"] = pd.to_datetime(df["datetime"])
         return df.sort_values("datetime").reset_index(drop=True)
+
+    def _load_accident_event_tables(self, accident_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        events_path = os.path.join(accident_dir, "incident_events.csv")
+        sensor_events_path = os.path.join(accident_dir, "incident_sensor_events.csv")
+        if not os.path.exists(events_path) or not os.path.exists(sensor_events_path):
+            return pd.DataFrame(), pd.DataFrame()
+
+        events = pd.read_csv(events_path)
+        sensor_events = pd.read_csv(sensor_events_path)
+        for col in ["incident_id", "subtype_id", "start_idx", "end_idx", "recovery_end_idx", "affected_sensor_count"]:
+            if col in events.columns:
+                events[col] = pd.to_numeric(events[col], errors="coerce")
+        for col in ["incident_id", "subtype_id", "affected_col_idx", "start_idx", "end_idx", "recovery_end_idx"]:
+            if col in sensor_events.columns:
+                sensor_events[col] = pd.to_numeric(sensor_events[col], errors="coerce")
+        if "incident_id" in events.columns:
+            events = events.set_index("incident_id", drop=False)
+        return events, sensor_events
 
     def _build_graph_links(self, edge_df: pd.DataFrame) -> list[dict]:
         if edge_df.empty:
@@ -654,12 +678,79 @@ class CaltransTrafficService:
             }
         return out
 
+    def _accident_event_packets(self, idx: int, sensor: int, *, limit: int = 50) -> list[dict]:
+        if self.accident_events.empty or self.accident_sensor_events.empty:
+            return []
+        if "affected_col_idx" not in self.accident_sensor_events.columns:
+            return []
+
+        t = int(idx) % self.t_len
+        edges = self.accident_sensor_events[
+            (self.accident_sensor_events["affected_col_idx"] == int(sensor))
+            & (self.accident_sensor_events["start_idx"] <= t)
+            & (self.accident_sensor_events["recovery_end_idx"] >= t)
+        ].copy()
+        if edges.empty:
+            return []
+
+        edges["is_active"] = edges["end_idx"] >= t
+        sort_cols = ["is_active", "severity", "spatial_weight", "distance_km"]
+        ascending = [False, False, False, True]
+        edges = edges.sort_values(sort_cols, ascending=ascending).head(limit)
+
+        out = []
+        for edge in edges.itertuples(index=False):
+            edge_dict = edge._asdict() if hasattr(edge, "_asdict") else {}
+            incident_id = _maybe_int(edge_dict.get("incident_id"))
+            event = {}
+            if incident_id is not None and incident_id in self.accident_events.index:
+                row = self.accident_events.loc[incident_id]
+                if isinstance(row, pd.DataFrame):
+                    row = row.iloc[0]
+                event = row.to_dict()
+
+            start_idx = _maybe_int(event.get("start_idx", edge_dict.get("start_idx")))
+            end_idx = _maybe_int(event.get("end_idx", edge_dict.get("end_idx")))
+            recovery_end_idx = _maybe_int(event.get("recovery_end_idx", edge_dict.get("recovery_end_idx")))
+            phase = "active" if end_idx is not None and t <= end_idx else "recovery"
+            minutes_since_start = (t - start_idx) * 5 if start_idx is not None else None
+            minutes_until_clear = (recovery_end_idx - t) * 5 if recovery_end_idx is not None else None
+
+            out.append(
+                {
+                    "incident_id": incident_id,
+                    "event_type": _maybe_str(event.get("event_type", edge_dict.get("event_type"))),
+                    "subtype_id": _maybe_int(event.get("subtype_id", edge_dict.get("subtype_id"))),
+                    "category": _maybe_str(event.get("category", edge_dict.get("category"))),
+                    "severity": _maybe_float(event.get("severity", edge_dict.get("severity")), 3),
+                    "duration_minutes": _maybe_float(event.get("duration_minutes"), 1),
+                    "phase": phase,
+                    "incident_datetime": _maybe_str(event.get("incident_datetime")),
+                    "end_datetime": _maybe_str(event.get("end_datetime")),
+                    "minutes_since_start": _maybe_int(minutes_since_start),
+                    "minutes_until_clear": _maybe_int(minutes_until_clear),
+                    "start_idx": start_idx,
+                    "end_idx": end_idx,
+                    "recovery_end_idx": recovery_end_idx,
+                    "freeway": _maybe_str(event.get("freeway")),
+                    "direction": _maybe_str(event.get("direction")),
+                    "location_text": _maybe_str(event.get("location_text")),
+                    "area_text": _maybe_str(event.get("area_text")),
+                    "affected_station_id": _maybe_str(edge_dict.get("affected_station_id")),
+                    "affected_station_name": _maybe_str(edge_dict.get("affected_station_name")),
+                    "distance_km": _maybe_float(edge_dict.get("distance_km"), 3),
+                    "spatial_weight": _maybe_float(edge_dict.get("spatial_weight"), 3),
+                }
+            )
+        return out
+
     def _accident_context_packet(self, t_obs: int, sensor: int) -> dict:
         if self.accident_features is None or not self.accident_feature_names:
             return {
                 "feature_names": [],
                 "current": {},
                 "active_features": [],
+                "current_events": [],
                 "history": [],
                 "summary": {"has_active_incident": False, "incident_total": 0.0},
             }
@@ -681,15 +772,19 @@ class CaltransTrafficService:
             )
 
         active_features = [name for name, payload in current.items() if bool(payload.get("active"))]
+        current_events = self._accident_event_packets(t_obs, sensor)
         return {
             "feature_names": list(self.accident_feature_names),
             "current": current,
             "active_features": active_features,
+            "current_events": current_events,
             "history": history,
             "summary": {
-                "has_active_incident": bool(float(current.get("incident_total", {}).get("value", 0.0) or 0.0) > 0.0),
+                "has_active_incident": bool(float(current.get("incident_total", {}).get("value", 0.0) or 0.0) > 0.0 or current_events),
                 "incident_total": _round(float(current.get("incident_total", {}).get("value", 0.0) or 0.0), 3),
                 "active_feature_count": int(len(active_features)),
+                "active_event_count": int(len([event for event in current_events if event.get("phase") == "active"])),
+                "current_event_count": int(len(current_events)),
             },
         }
 
@@ -936,6 +1031,7 @@ class CaltransTrafficService:
         ts = self.timestamps[int(idx) % self.t_len]
         precip_in = self._weather_value(row, "precip", 0.0)
         wind_mph = self._weather_value(row, "windspeed", 0.0)
+        wind_dir = self._weather_value(row, "winddir", 0.0)
         cloud = self._weather_value(row, "cloudcover", 0.0)
         humidity = self._weather_value(row, "humidity", 50.0)
         visibility = self._weather_value(row, "visibility", 10.0)
@@ -947,6 +1043,8 @@ class CaltransTrafficService:
             "temp_c": _round((temp_f - 32.0) * 5.0 / 9.0, 1),
             "humidity": _round(humidity, 1),
             "wind_kmh": _round(wind_mph * MPH_TO_KMH, 1),
+            "wind_dir_deg": _round(wind_dir, 0),
+            "wind_dir_cardinal": _wind_cardinal(wind_dir),
             "precip_mm": _round(precip_in * INCH_TO_MM, 2),
             "cloudcover": _round(cloud, 1),
             "visibility_km": _round(max(visibility, 0.0) * 1.60934, 2),
@@ -997,6 +1095,8 @@ class CaltransTrafficService:
                 "temp_c": _round((pd_val("temp", 60.0) - 32.0) * 5.0 / 9.0, 1),
                 "humidity": _round(pd_val("humidity", 50.0), 1),
                 "wind_kmh": _round(pd_val("windspeed", 0.0) * MPH_TO_KMH, 1),
+                "wind_dir_deg": _round(pd_val("winddir", 0.0), 0),
+                "wind_dir_cardinal": _wind_cardinal(pd_val("winddir", 0.0)),
                 "precip_mm": _round(pd_val("precip", 0.0) * INCH_TO_MM, 2),
                 "cloudcover": _round(pd_val("cloudcover", 0.0), 1),
                 "visibility_km": _round(max(pd_val("visibility", 10.0), 0.0) * 1.60934, 2),
@@ -1899,6 +1999,12 @@ class CaltransTrafficService:
         )
         peak_scores = all_scores.max(axis=0)
         peak_levels = all_levels.max(axis=0)
+        current_scores, current_levels = self._risk_from_arrays(
+            indices=np.asarray([t_obs], dtype=np.int64),
+            flow=self.flow_raw[np.asarray([t_obs], dtype=np.int64)],
+            occupancy=self.occupancy_raw[np.asarray([t_obs], dtype=np.int64)],
+            speed=self.speed_raw[np.asarray([t_obs], dtype=np.int64)],
+        )
 
         peak_key = max(windows, key=lambda k: float(windows[k]["congestion_score"]))
         station_meta = self.metadata.iloc[sensor]
@@ -1963,15 +2069,18 @@ class CaltransTrafficService:
             "incident_scenarios": incident_scenarios,
             "congestion_summary": {
                 "current_level": current_packet["congestion_level"],
+                "current_score": current_packet["congestion_score"],
                 "current_probability": current_packet["congestion_probability"],
                 "peak_window": peak_key,
                 "peak_minutes_ahead": int(windows[peak_key]["minutes_ahead"]),
                 "peak_level": windows[peak_key]["congestion_level"],
                 "peak_score": _round(float(windows[peak_key]["congestion_score"]), 3),
                 "peak_probability": _round(float(windows[peak_key]["congestion_probability"]), 3),
-                "headline": f"{windows[peak_key]['minutes_ahead']} 分钟窗口拥堵概率最高",
+                "headline": f"{windows[peak_key]['minutes_ahead']} 分钟窗口拥堵程度最高",
             },
             "global_state": {
+                "current_levels": current_levels[0].astype(int).tolist(),
+                "current_scores": [_round(v, 3) for v in current_scores[0].tolist()],
                 "pred_levels": peak_levels.astype(int).tolist(),
                 "pred_scores": [_round(v, 3) for v in peak_scores.tolist()],
             },

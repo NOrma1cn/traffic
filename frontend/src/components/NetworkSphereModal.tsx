@@ -4,21 +4,10 @@ import * as THREE from 'three';
 import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
 // @ts-ignore
 import { geoVoronoi } from 'd3-geo-voronoi';
-import { deriveWeatherVisual, type WeatherDecalCondition } from '../weather';
 
 /* ─────────────────────────── Types ─────────────────────────── */
 
-export interface WeatherData {
-  condition: string;
-  precipitation_pct: number;
-  cloudcover: number;
-  wind_kmh: number;
-  temp_c?: number;
-  humidity?: number;
-  month_index?: number;
-}
-
-export type PanoramaMode = 'weather' | 'congestion' | 'spacetime';
+export type PanoramaMode = 'congestion' | 'segment';
 
 interface NetworkSphereModalProps {
   isOpen: boolean;
@@ -28,13 +17,10 @@ interface NetworkSphereModalProps {
   onToggleViewMode?: () => void;
   graphData: { nodes: any[]; links: any[]; metadata?: any } | null;
   globalLevels: number[];
+  globalScores?: number[];
   selectedSensor: number;
   highlightedSensor?: number | null;
   viewMode?: PanoramaMode;
-  // Weather can now be an array of 12 distinct months from the backend
-  weather?: WeatherData | WeatherData[] | null;
-  // Spacetime mode: month for each nation (12 nations, 1-12)
-  spacetimeMonths?: number[];
   sensorCount?: number;
   currentTimeIndex?: number;
   currentSimTime?: string | null;
@@ -42,10 +28,15 @@ interface NetworkSphereModalProps {
   previewSensor?: number | null;
   previewTimeIndex?: number | null;
   onPreviewChange?: (sensorId: number, timeIndex: number) => void;
+  selectedMonth?: number;
+  selectedDay?: number;
+  onDateChange?: (month: number, day: number) => void;
 }
 
 export interface RegionNation {
   nationIdx: number;
+  key: string;
+  label: string;
   childSensors: number[];
   polygon3D: THREE.Vector3[]; // Border ring
   centroid3D: THREE.Vector3;  // Capital / Icon location
@@ -56,7 +47,6 @@ export interface RegionNation {
 
 const SPHERE_R = 2.0;
 const PHI = Math.PI * (3 - Math.sqrt(5));
-const NUM_NATIONS = 12;
 const MIN_CAMERA_DISTANCE = 3.8;
 const MAX_CAMERA_DISTANCE = 9.0;
 const MIN_ROTATE_SPEED = 0.9;
@@ -78,6 +68,7 @@ const DAYS_IN_MONTH_2023 = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const MONTH_MAPPING = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 const FINAL_ANGLES = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180];
 const COLLAPSED_ANGLES = Array.from({ length: 12 }, (_, i) => -45 + i * (90 / 11));
+const NETWORK_STRIP_VISIBLE_COUNT = 19;
 
 function clampMonth(month: number) {
   const m = Math.floor(month);
@@ -165,6 +156,7 @@ function getRenderPixelRatio(width: number, height: number) {
 /* ─────────────────── Helpers ─────────────────── */
 
 function fibSphere(N: number): THREE.Vector3[] {
+  if (N <= 1) return [new THREE.Vector3(0, 0, 1)];
   const pts: THREE.Vector3[] = [];
   for (let i = 0; i < N; i++) {
     const y = 1 - (i / (N - 1)) * 2;
@@ -228,17 +220,214 @@ function withSaturation(color: THREE.Color, saturation: number, target: THREE.Co
 
 function congestionPercentFromNodeLevel(level: number) {
   if (level >= 3) return 100;
+  if (level >= 2) return 75;
   if (level >= 1) return 50;
   return 0;
 }
 
-function congestionPercentFromSensors(sensorIds: number[], levels: number[]) {
+function congestionPercentFromSensors(sensorIds: number[], levels: number[], scores?: number[]) {
   if (sensorIds.length === 0) return 0;
+  let scoreTotal = 0;
+  let scoreCount = 0;
+  if (scores?.length) {
+    for (const sensorId of sensorIds) {
+      const score = scores[sensorId];
+      if (!Number.isFinite(score)) continue;
+      scoreTotal += Math.max(0, Math.min(1, score));
+      scoreCount++;
+    }
+    if (scoreCount > 0) return Math.round((scoreTotal / scoreCount) * 100);
+  }
+
   let total = 0;
   for (const sensorId of sensorIds) {
     total += congestionPercentFromNodeLevel(levels[sensorId] ?? 0);
   }
   return Math.round(total / sensorIds.length);
+}
+
+function normalizeRoadValue(value: unknown, fallback: string) {
+  const raw = String(value ?? '').trim();
+  return raw.length > 0 && raw.toLowerCase() !== 'nan' ? raw : fallback;
+}
+
+function getRoadSegmentMeta(node: any) {
+  const freeway = normalizeRoadValue(node?.freeway, 'UNKNOWN');
+  return {
+    key: freeway,
+    label: freeway,
+  };
+}
+
+function normalizeRouteKey(value: unknown) {
+  return String(value ?? '').trim().toUpperCase();
+}
+
+function finiteNumber(value: unknown, fallback: number) {
+  const next = Number(value);
+  return Number.isFinite(next) ? next : fallback;
+}
+
+function scoreToStripColor(score: number | undefined, level: number | undefined) {
+  const resolvedScore = Number.isFinite(score) ? Math.max(0, Math.min(1, Number(score))) : undefined;
+  if (resolvedScore !== undefined) {
+    if (resolvedScore >= 0.8) return '#ff3b30';
+    if (resolvedScore >= 0.6) return '#ff8a2a';
+    if (resolvedScore >= 0.35) return '#ffcc00';
+    return '#0a84ff';
+  }
+  const resolvedLevel = Number(level ?? 0);
+  if (resolvedLevel >= 3) return '#ff3b30';
+  if (resolvedLevel >= 2) return '#ff8a2a';
+  if (resolvedLevel >= 1) return '#ffcc00';
+  return '#0a84ff';
+}
+
+function buildNetworkStripData(
+  graphData: { nodes: any[]; links: any[]; metadata?: any } | null,
+  focusSensor: number,
+  globalScores: number[],
+  globalLevels: number[],
+): NetworkStripData | null {
+  const nodes = graphData?.nodes;
+  if (!nodes?.length || focusSensor < 0 || focusSensor >= nodes.length) return null;
+
+  const focusNode = nodes[focusSensor];
+  const freeway = normalizeRouteKey(focusNode?.freeway);
+  const direction = normalizeRouteKey(focusNode?.direction);
+  if (!freeway || !direction) return null;
+
+  const corridor = nodes
+    .map((node, sensorIdx) => ({ node, sensorIdx }))
+    .filter(({ node }) => normalizeRouteKey(node?.freeway) === freeway && normalizeRouteKey(node?.direction) === direction)
+    .sort((a, b) => {
+      const pmDelta = finiteNumber(a.node?.abs_pm, a.sensorIdx) - finiteNumber(b.node?.abs_pm, b.sensorIdx);
+      return pmDelta || a.sensorIdx - b.sensorIdx;
+    });
+
+  const focusIndex = corridor.findIndex(({ sensorIdx }) => sensorIdx === focusSensor);
+  if (focusIndex === -1) return null;
+
+  const visibleCount = Math.min(NETWORK_STRIP_VISIBLE_COUNT, corridor.length);
+  const halfWindow = Math.floor(visibleCount / 2);
+  const start = Math.max(0, Math.min(focusIndex - halfWindow, corridor.length - visibleCount));
+  const end = start + visibleCount;
+  const visible = corridor.slice(start, end).map(({ node, sensorIdx }, localIndex) => {
+    const absoluteIndex = start + localIndex;
+    const score = globalScores[sensorIdx];
+    const level = globalLevels[sensorIdx];
+    return {
+      sensorIdx,
+      absoluteIndex,
+      label: String(node?.station_name ?? node?.name ?? `Sensor ${sensorIdx + 1}`),
+      absPm: finiteNumber(node?.abs_pm, sensorIdx),
+      score: Number.isFinite(score) ? Math.max(0, Math.min(1, Number(score))) : undefined,
+      level: Number.isFinite(level) ? Number(level) : undefined,
+      color: scoreToStripColor(score, level),
+      isCurrent: sensorIdx === focusSensor,
+      distance: Math.abs(absoluteIndex - focusIndex),
+    };
+  });
+
+  return {
+    freeway,
+    direction,
+    total: corridor.length,
+    position: focusIndex + 1,
+    start,
+    end,
+    focusSensor,
+    currentName: String(focusNode?.station_name ?? focusNode?.name ?? `Sensor ${focusSensor + 1}`),
+    visible,
+  };
+}
+
+function buildAbstractSegmentPositions(nations: RegionNation[], nodes: any[], sensorCount: number) {
+  const positions = new Array<THREE.Vector3>(sensorCount);
+  const basePositions = fibSphere(sensorCount).map((p) => p.normalize());
+  const segmentSeeds = fibSphere(Math.max(1, nations.length)).map((p) => p.normalize());
+  const ownedPoints = Array.from({ length: nations.length }, () => [] as number[]);
+  const allPointIds = Array.from({ length: sensorCount }, (_, i) => i);
+  const allNationIds = nations.map((_, ni) => ni);
+
+  const axisValue = (v: THREE.Vector3, axis: number) => axis === 0 ? v.x : axis === 1 ? v.y : v.z;
+  const chooseSplitAxis = (pointIds: number[]) => {
+    const mean = new THREE.Vector3();
+    for (const pi of pointIds) mean.add(basePositions[pi]);
+    mean.multiplyScalar(1 / Math.max(1, pointIds.length));
+
+    const variance = [0, 0, 0];
+    for (const pi of pointIds) {
+      const p = basePositions[pi];
+      variance[0] += Math.pow(p.x - mean.x, 2);
+      variance[1] += Math.pow(p.y - mean.y, 2);
+      variance[2] += Math.pow(p.z - mean.z, 2);
+    }
+    return variance[0] > variance[1] && variance[0] > variance[2] ? 0 : variance[1] > variance[2] ? 1 : 2;
+  };
+
+  const partition = (nationIds: number[], pointIds: number[]) => {
+    if (nationIds.length === 0 || pointIds.length === 0) return;
+    if (nationIds.length === 1) {
+      ownedPoints[nationIds[0]].push(...pointIds);
+      return;
+    }
+
+    const axis = chooseSplitAxis(pointIds);
+    const sortedNations = [...nationIds].sort((a, b) =>
+      axisValue(segmentSeeds[a] ?? new THREE.Vector3(0, 0, 1), axis) -
+      axisValue(segmentSeeds[b] ?? new THREE.Vector3(0, 0, 1), axis)
+    );
+    const sortedPoints = [...pointIds].sort((a, b) =>
+      axisValue(basePositions[a], axis) - axisValue(basePositions[b], axis)
+    );
+
+    const total = sortedNations.reduce((sum, ni) => sum + nations[ni].childSensors.length, 0);
+    let bestSplit = 1;
+    let bestDelta = Infinity;
+    let running = 0;
+    for (let i = 1; i < sortedNations.length; i++) {
+      running += nations[sortedNations[i - 1]].childSensors.length;
+      const delta = Math.abs(total / 2 - running);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        bestSplit = i;
+      }
+    }
+
+    const leftNations = sortedNations.slice(0, bestSplit);
+    const rightNations = sortedNations.slice(bestSplit);
+    const leftCount = leftNations.reduce((sum, ni) => sum + nations[ni].childSensors.length, 0);
+
+    partition(leftNations, sortedPoints.slice(0, leftCount));
+    partition(rightNations, sortedPoints.slice(leftCount));
+  };
+
+  partition(allNationIds, allPointIds);
+
+  for (let ni = 0; ni < nations.length; ni++) {
+    const seed = segmentSeeds[ni] ?? new THREE.Vector3(0, 0, 1);
+    const ref = Math.abs(seed.y) > 0.85 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    const axisA = new THREE.Vector3().crossVectors(ref, seed).normalize();
+    const axisB = new THREE.Vector3().crossVectors(seed, axisA).normalize();
+    const pointIds = ownedPoints[ni]
+      .sort((a, b) => {
+        const pa = basePositions[a];
+        const pb = basePositions[b];
+        const aa = Math.atan2(pa.dot(axisB), pa.dot(axisA));
+        const ab = Math.atan2(pb.dot(axisB), pb.dot(axisA));
+        return aa - ab;
+      });
+    const sensorIds = [...nations[ni].childSensors]
+      .sort((a, b) => Number(nodes[a]?.abs_pm ?? a) - Number(nodes[b]?.abs_pm ?? b));
+
+    sensorIds.forEach((sensorId, idx) => {
+      const pointId = pointIds[idx] ?? sensorId;
+      positions[sensorId] = basePositions[pointId].clone().multiplyScalar(SPHERE_R);
+    });
+  }
+
+  return positions.map((position, i) => position ?? basePositions[i].clone().multiplyScalar(SPHERE_R));
 }
 
 function drawCongestionBadge(
@@ -304,7 +493,7 @@ function relaxedSeedFromFeature(feature: any): THREE.Vector3 {
   return centroid.normalize().multiplyScalar(SPHERE_R);
 }
 
-/* ─────────────────── Nation Topology ─────────────────── */
+/* ─────────────────── Road Segment Topology ─────────────────── */
 
 function buildNations(graphData: any, globalLevels: number[]): {
   nations: RegionNation[], 
@@ -318,9 +507,32 @@ function buildNations(graphData: any, globalLevels: number[]): {
 
   const nodes = graphData.nodes;
   const sensorCount = nodes.length;
-  // Use abstract uniform distribution (Fibonacci Sphere) instead of real geographic lat/lon mapping
-  // This avoids clumping bugs and ensures a premium "Weather Net" aesthetic covering the whole globe
-  const sensorPositions = fibSphere(sensorCount).map(p => p.multiplyScalar(SPHERE_R));
+
+  // Road segment grouping: each freeway corridor owns one abstract Voronoi region.
+  const segmentIndex = new Map<string, number>();
+  const nations: RegionNation[] = [];
+
+  for (let si = 0; si < sensorCount; si++) {
+    const meta = getRoadSegmentMeta(nodes[si]);
+    let nIdx = segmentIndex.get(meta.key);
+    if (nIdx === undefined) {
+      nIdx = nations.length;
+      segmentIndex.set(meta.key, nIdx);
+      nations.push({
+        nationIdx: nIdx,
+        key: meta.key,
+        label: meta.label,
+        childSensors: [],
+        polygon3D: [],
+        centroid3D: new THREE.Vector3(0, 0, 1),
+        level: 0,
+      });
+    }
+    nations[nIdx].childSensors.push(si);
+  }
+
+  // Keep the previous abstract sphere/Voronoi look, but cluster sensors by segment so regions are contiguous.
+  const sensorPositions = buildAbstractSegmentPositions(nations, nodes, sensorCount);
 
   // 1. Primitive Cells: Generate Voronoi territories
   let polys: any;
@@ -345,27 +557,6 @@ function buildNations(graphData: any, globalLevels: number[]): {
       lonLatTo3D(pt[0], pt[1], SPHERE_R)
     );
     cellPolygons.push(ring3D);
-  }
-
-  // 2. Nation Clustering: Deploy 12 Capitals and assign cells
-  const nationSeeds = fibSphere(NUM_NATIONS);
-  const nations: RegionNation[] = Array.from({length: NUM_NATIONS}, (_, i) => ({
-    nationIdx: i,
-    childSensors: [],
-    polygon3D: [], 
-    centroid3D: nationSeeds[i], 
-    level: 0,
-  }));
-
-  for (let si = 0; si < sensorCount; si++) {
-    let minD = Infinity;
-    let closestN = 0;
-    const pos = sensorPositions[si];
-    for (let ni = 0; ni < NUM_NATIONS; ni++) {
-      const d = pos.distanceToSquared(nationSeeds[ni]);
-      if (d < minD) { minD = d; closestN = ni; }
-    }
-    nations[closestN].childSensors.push(si);
   }
 
   for (const n of nations) {
@@ -413,54 +604,6 @@ function buildNations(graphData: any, globalLevels: number[]): {
   return { nations, sensorPositions, borderEdges, cellPolygons };
 }
 
-/* ─────────────────── 3D Floating Vector Decals ─────────────────── */
-
-function createWeatherMaterialCache(): Record<string, THREE.MeshBasicMaterial> {
-  const cache: Record<string, THREE.MeshBasicMaterial> = {};
-  const types: WeatherDecalCondition[] = ['Sun', 'Rainy', 'Cloudy'];
-
-  types.forEach(cond => {
-    const canvas = document.createElement('canvas');
-    canvas.width = 512;
-    canvas.height = 512;
-    const ctx = canvas.getContext('2d')!;
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.minFilter = THREE.LinearFilter;
-    
-    let svgStr = '';
-    if (cond === 'Sun') {
-       svgStr = `<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 24 24" fill="none" stroke="%23fbbf24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>`;
-    } else if (cond === 'Rainy') {
-       svgStr = `<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 24 24" fill="none" stroke="%2360a5fa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M16 14v6"/><path d="M8 14v6"/><path d="M12 16v6"/></svg>`;
-    } else {
-       svgStr = `<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 24 24" fill="none" stroke="%23e5e5e5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>`;
-    }
-
-    const img = new Image();
-    img.onload = () => {
-        ctx.shadowColor = cond === 'Rainy' ? 'rgba(96, 165, 250, 0.4)' 
-                        : cond === 'Sun' ? 'rgba(251, 191, 36, 0.4)' 
-                        : 'rgba(255, 255, 255, 0.3)';
-        ctx.shadowBlur = 15;
-        ctx.shadowOffsetX = 0;
-        ctx.shadowOffsetY = 4;
-        ctx.drawImage(img, 48, 48, 416, 416);
-        tex.needsUpdate = true;
-    };
-    img.src = "data:image/svg+xml;charset=utf-8," + svgStr;
-
-    cache[cond] = new THREE.MeshBasicMaterial({ 
-       map: tex, 
-       transparent: true, 
-       side: THREE.DoubleSide, 
-       depthWrite: false, 
-       depthTest: true 
-    });
-  });
-  
-  return cache;
-}
-
 /* ─────────────────── Three.js Scene Builder ─────────────────── */
 
 function buildScene(
@@ -473,10 +616,10 @@ function buildScene(
     selectedSensor: number;
     highlightedSensor: number | null;
     globalLevels: number[];
-    weathersData: WeatherData[];
+    globalScores?: number[];
     viewMode: PanoramaMode;
-    spacetimeMonths: number[];
   }>,
+  sceneActiveRef: React.MutableRefObject<boolean>,
   onSelectSensor: (idx: number) => void,
   onZoomChange: (dist: number) => void,
   onFpsUpdate?: (fps: number) => void,
@@ -547,64 +690,59 @@ function buildScene(
   occluderMesh.renderOrder = -1; // Ensure occluder is drafted into depth buffer before transparent lines
   scene.add(occluderMesh);
 
-  /* ── 1. Inject 3D Floating Vector Decals ── */
-  const weatherIcons: {
-    weatherMesh: THREE.Mesh,
-    weatherMaterial: THREE.MeshBasicMaterial,
+  /* ── 1. Inject 3D Floating Segment Labels ── */
+  const regionLabels: {
     congestionMesh: THREE.Mesh,
-    spacetimeMesh: THREE.Mesh,
+    segmentMesh: THREE.Mesh,
     basePos: THREE.Vector3,
+    segmentPos: THREE.Vector3,
+    segmentQuat: THREE.Quaternion,
     upDir: THREE.Vector3,
     nIdx: number,
     congestionTexture: THREE.CanvasTexture,
     congestionMaterial: THREE.MeshBasicMaterial,
     congestionCtx: CanvasRenderingContext2D,
     lastPct: number,
-    spacetimeTexture: THREE.CanvasTexture,
-    spacetimeMaterial: THREE.MeshBasicMaterial,
-    spacetimeCtx: CanvasRenderingContext2D,
-    lastMonth: number,
+    segmentTexture: THREE.CanvasTexture,
+    segmentMaterial: THREE.MeshBasicMaterial,
+    segmentCtx: CanvasRenderingContext2D,
+    lastLabel: string,
     // 当前透明度（用于平滑过渡）
-    currentWeatherOpacity: number,
     currentCongestionOpacity: number,
-    currentSpacetimeOpacity: number,
+    currentSegmentOpacity: number,
   }[] = [];
-  const { weathersData, spacetimeMonths } = latestProps.current;
-  const initWxFallback = weathersData && weathersData.length > 0 ? weathersData[0] : null;
-  const decalMats = createWeatherMaterialCache();
+  const maxRegionSensorCount = Math.max(1, ...nations.map((nation) => nation.childSensors.length));
   
-  // 绘制月份标签的函数
-  const drawMonthLabel = (
+  const drawSegmentLabel = (
     ctx: CanvasRenderingContext2D,
     size: number,
-    month: number,
-    _color: THREE.Color,
+    label: string,
   ) => {
     ctx.clearRect(0, 0, size, size);
     ctx.save();
     ctx.translate(size / 2, size / 2);
-    ctx.font = `800 ${Math.round(size * 0.32)}px "Helvetica Neue", Arial, sans-serif`;
+    ctx.font = `800 ${Math.round(size * 0.17)}px "Helvetica Neue", Arial, sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = 'rgba(255, 255, 255, 0.98)';
-    ctx.fillText(`${month}月`, 0, 0);
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+    ctx.shadowBlur = 12;
+    ctx.fillText(label, 0, 0, size * 0.82);
     ctx.restore();
   };
   
   for (let i = 0; i < nations.length; i++) {
       const n = nations[i];
-      const wx = (weathersData && weathersData[i]) || initWxFallback;
-      const cond = deriveWeatherVisual(wx).decalCondition;
+      const areaRatio = Math.sqrt(n.childSensors.length / maxRegionSensorCount);
+      const congestionLabelScale = THREE.MathUtils.lerp(0.42, 0.78, areaRatio);
+      const segmentLabelScale = THREE.MathUtils.lerp(0.46, 0.92, areaRatio);
       
       const geo = new THREE.PlaneGeometry(1, 1);
-      const weatherMaterial = decalMats[cond].clone();
-      weatherMaterial.map = decalMats[cond].map;
-      const weatherMesh = new THREE.Mesh(geo, weatherMaterial);
-      weatherMesh.scale.set(0.65, 0.65, 1.0);
       
       const upDir = n.centroid3D.clone().normalize();
-      const basePos = upDir.clone().multiplyScalar(SPHERE_R + 0.12); 
-      weatherMesh.position.copy(basePos);
+      const basePos = upDir.clone().multiplyScalar(SPHERE_R + 0.12);
+      const segmentPos = upDir.clone().multiplyScalar(SPHERE_R + 0.055);
+      const segmentQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), upDir);
 
       const congestionCanvas = document.createElement('canvas');
       congestionCanvas.width = 512;
@@ -613,7 +751,7 @@ function buildScene(
       const congestionTexture = new THREE.CanvasTexture(congestionCanvas);
       congestionTexture.minFilter = THREE.LinearFilter;
       const initialNationLevel = getNationLevel(i, latestProps.current.globalLevels);
-      const initialPct = congestionPercentFromSensors(n.childSensors, latestProps.current.globalLevels);
+      const initialPct = congestionPercentFromSensors(n.childSensors, latestProps.current.globalLevels, latestProps.current.globalScores);
       const initialColor = levelToPulseColor(initialNationLevel);
       drawCongestionBadge(congestionCtx, 512, initialPct, initialColor);
       congestionTexture.needsUpdate = true;
@@ -625,52 +763,53 @@ function buildScene(
         depthTest: true,
       });
       const congestionMesh = new THREE.Mesh(geo, congestionMaterial);
-      congestionMesh.scale.set(0.65, 0.65, 1.0);
+      congestionMesh.scale.set(congestionLabelScale, congestionLabelScale, 1.0);
       congestionMesh.position.copy(basePos);
       
-      // 时空模式：月份标签
-      const spacetimeCanvas = document.createElement('canvas');
-      spacetimeCanvas.width = 512;
-      spacetimeCanvas.height = 512;
-      const spacetimeCtx = spacetimeCanvas.getContext('2d')!;
-      const spacetimeTexture = new THREE.CanvasTexture(spacetimeCanvas);
-      spacetimeTexture.minFilter = THREE.LinearFilter;
-      const initialMonth = spacetimeMonths[i] || 1;
-      drawMonthLabel(spacetimeCtx, 512, initialMonth, new THREE.Color(0xffffff));
-      spacetimeTexture.needsUpdate = true;
-      const spacetimeMaterial = new THREE.MeshBasicMaterial({
-        map: spacetimeTexture,
+      const segmentCanvas = document.createElement('canvas');
+      segmentCanvas.width = 512;
+      segmentCanvas.height = 512;
+      const segmentCtx = segmentCanvas.getContext('2d')!;
+      const segmentTexture = new THREE.CanvasTexture(segmentCanvas);
+      segmentTexture.minFilter = THREE.LinearFilter;
+      drawSegmentLabel(segmentCtx, 512, n.label);
+      segmentTexture.needsUpdate = true;
+      const segmentMaterial = new THREE.MeshBasicMaterial({
+        map: segmentTexture,
         transparent: true,
         side: THREE.DoubleSide,
         depthWrite: false,
         depthTest: true,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
       });
-      const spacetimeMesh = new THREE.Mesh(geo, spacetimeMaterial);
-      spacetimeMesh.scale.set(0.65, 0.65, 1.0);
-      spacetimeMesh.position.copy(basePos);
+      const segmentMesh = new THREE.Mesh(geo, segmentMaterial);
+      segmentMesh.scale.set(segmentLabelScale, segmentLabelScale, 1.0);
+      segmentMesh.position.copy(segmentPos);
+      segmentMesh.quaternion.copy(segmentQuat);
+      segmentMesh.renderOrder = 8;
       
-      scene.add(weatherMesh);
       scene.add(congestionMesh);
-      scene.add(spacetimeMesh);
-      weatherIcons.push({
-        weatherMesh,
-        weatherMaterial,
+      scene.add(segmentMesh);
+      regionLabels.push({
         congestionMesh,
-        spacetimeMesh,
+        segmentMesh,
         basePos,
+        segmentPos,
+        segmentQuat,
         upDir,
         nIdx: i,
         congestionTexture,
         congestionMaterial,
         congestionCtx,
         lastPct: initialPct,
-        spacetimeTexture,
-        spacetimeMaterial,
-        spacetimeCtx,
-        lastMonth: initialMonth,
-        currentWeatherOpacity: 0,
+        segmentTexture,
+        segmentMaterial,
+        segmentCtx,
+        lastLabel: n.label,
         currentCongestionOpacity: 0,
-        currentSpacetimeOpacity: 0,
+        currentSegmentOpacity: 0,
       });
   }
 
@@ -800,7 +939,7 @@ function buildScene(
   
   // 国界线亮度过渡（时空模式专用）
   let borderBrightness = 0.5; // 0.5 = 正常，1.0 = 高亮（白色）
-  let borderBrightnessTarget = latestProps.current.viewMode === 'spacetime' ? 1.0 : 0.5;
+  let borderBrightnessTarget = latestProps.current.viewMode === 'segment' ? 1.0 : 0.5;
   let borderBrightnessTransitionDuration = 0.6;
   let faceColorsNeedUpdate = true;
   let pointerInside = false;
@@ -845,7 +984,7 @@ function buildScene(
     const newTarget = nextViewMode === 'congestion' ? 1 : 0;
     
     // 更新国界线亮度目标
-    borderBrightnessTarget = nextViewMode === 'spacetime' ? 1.0 : 0.5;
+    borderBrightnessTarget = nextViewMode === 'segment' ? 1.0 : 0.5;
     
     // 如果正在过渡中且目标方向相反，智能反转而不是重置
     if (congestionTransitionActive && congestionTransitionTarget !== newTarget) {
@@ -1047,6 +1186,15 @@ function buildScene(
     const dt = (now - lastFrame) / 1000;
     lastFrame = now;
     elapsed += dt;
+    if (!sceneActiveRef.current) {
+      if (fpsFrames !== 0) {
+        fpsFrames = 0;
+        fpsLastSampleAt = now;
+        onFpsUpdate?.(0);
+      }
+      return;
+    }
+
     fpsFrames += 1;
     if (onFpsUpdate && now - fpsLastSampleAt >= 250) {
       const sampledFps = (fpsFrames * 1000) / Math.max(now - fpsLastSampleAt, 1);
@@ -1117,6 +1265,9 @@ function buildScene(
         hoveredNation = newHoverNation;
         hoveredSensor = newHoveredSensor;
         updateNodes();
+        if (viewMode === 'segment') {
+          faceColorsNeedUpdate = true;
+        }
         if (levelsChanged) {
           activeGlobalLevels = latestProps.current.globalLevels;
           faceColorsNeedUpdate = true;
@@ -1136,7 +1287,7 @@ function buildScene(
           
           lastModeSwitchTime = elapsed;
           faceColorsNeedUpdate = true;
-        } else if ((sensorChanged || highlightedChanged || focusChanged) && activeViewMode === 'weather' && !congestionTransitionActive && congestionTransitionTarget === 0) {
+        } else if ((sensorChanged || highlightedChanged || focusChanged) && activeViewMode === 'segment' && !congestionTransitionActive && congestionTransitionTarget === 0) {
           faceColorsNeedUpdate = true;
         }
         if (focusChanged) {
@@ -1155,7 +1306,6 @@ function buildScene(
     pulseElapsed += dt;
     const pulseTotalDuration = pulseTravelDuration + pulseRiseDuration + pulseHoldDuration + pulseFadeDuration;
     const pulseActive = pulseElapsed <= pulseTotalDuration;
-    let maxOverlayMix = 0;
     if (congestionTransitionActive) {
       congestionTransitionElapsed += dt;
       let transitionDone = true;
@@ -1172,24 +1322,20 @@ function buildScene(
         }
         sensorOverlayMix[i] = nextMix;
         if (Math.abs(nextMix - congestionTransitionTarget) > 0.001) transitionDone = false;
-        if (nextMix > maxOverlayMix) maxOverlayMix = nextMix;
       }
       if (transitionDone) {
         congestionTransitionActive = false;
         for (let i = 0; i < sensorCount; i++) {
           sensorOverlayMix[i] = congestionTransitionTarget;
         }
-        maxOverlayMix = congestionTransitionTarget;
       }
     } else {
-      maxOverlayMix = congestionTransitionTarget;
       if (faceColorsNeedUpdate) {
         for (let i = 0; i < sensorCount; i++) {
           sensorOverlayMix[i] = congestionTransitionTarget;
         }
       }
     }
-    const showCongestionOverlay = congestionTransitionTarget === 1 || congestionTransitionActive || maxOverlayMix > 0.001;
     
     // Smoothly update shader mode uniform
     const curUMode = 0;
@@ -1203,10 +1349,13 @@ function buildScene(
       for (let sensorIdx = 0; sensorIdx < sensorCount; sensorIdx++) {
         const sensorLevel = latestProps.current.globalLevels[sensorIdx] ?? 0;
         let alpha = 0;
+        const nationId = sensorToNation[sensorIdx];
         const angle = sensorPulseAngles[sensorIdx] ?? pulseMaxAngle;
         const arrivalTime = angle / Math.max(pulseAngularSpeed, 0.001);
         const localPulseElapsed = pulseElapsed - arrivalTime;
         const congestionMix = THREE.MathUtils.clamp(sensorLevel / 3.0, 0, 1);
+        const overlayMix = THREE.MathUtils.clamp(sensorOverlayMix[sensorIdx], 0, 1);
+        const segmentMix = 1 - overlayMix;
 
         // 计算脉冲混合度
         let pulseMix = 0;
@@ -1246,15 +1395,13 @@ function buildScene(
         withSaturation(basePulseCol, saturation, pulseColor);
         basePulseCol.copy(pulseColor);
 
-        if (showCongestionOverlay) {
-          // 拥堵模式：基础颜色 + 脉冲高亮
-          const baseAlpha = sensorOverlayMix[sensorIdx] * (0.08 + congestionMix * 0.3);
-          alpha = baseAlpha + pulseMix * 0.25;
-        } else {
-          // 天气模式：仅显示脉冲
-          const maxAlpha = 0.55 + congestionMix * 0.25;
-          alpha = pulseMix * maxAlpha;
-        }
+        const segmentHue = ((Math.max(0, nationId) * 0.61803398875) % 1 + 1) % 1;
+        pulseColor.setHSL(segmentHue, 0.42, 0.34);
+        basePulseCol.lerp(pulseColor, segmentMix);
+
+        const congestionAlpha = overlayMix * (0.08 + congestionMix * 0.3 + pulseMix * 0.25);
+        const segmentAlpha = nationId === hoveredNation ? 0.32 : 0.2;
+        alpha = THREE.MathUtils.lerp(congestionAlpha, segmentAlpha, segmentMix);
 
         sensorFaceAlphas[sensorIdx] = alpha;
       }
@@ -1336,71 +1483,56 @@ function buildScene(
       focusRingMesh.visible = false;
     }
 
-    // ── Update 3D Floating Weather Plane Decals ──
-    for (const wi of weatherIcons) {
+    // ── Update 3D Floating Road Segment Labels ──
+    for (const wi of regionLabels) {
        const nationLevel = getNationLevel(wi.nIdx, latestProps.current.globalLevels);
-       const pct = congestionPercentFromSensors(nations[wi.nIdx]?.childSensors ?? [], latestProps.current.globalLevels);
+        const pct = congestionPercentFromSensors(nations[wi.nIdx]?.childSensors ?? [], latestProps.current.globalLevels, latestProps.current.globalScores);
        if (pct !== wi.lastPct) {
          drawCongestionBadge(wi.congestionCtx, 512, pct, levelToNodeColor(nationLevel));
          wi.congestionTexture.needsUpdate = true;
          wi.lastPct = pct;
        }
-       
-       // 更新月份标签（如果需要）
-       const currentMonth = latestProps.current.spacetimeMonths[wi.nIdx] || 1;
-       if (currentMonth !== wi.lastMonth) {
-         drawMonthLabel(wi.spacetimeCtx, 512, currentMonth, new THREE.Color(0xffffff));
-         wi.spacetimeTexture.needsUpdate = true;
-         wi.lastMonth = currentMonth;
+       const currentLabel = nations[wi.nIdx]?.label ?? '未知路段';
+       if (currentLabel !== wi.lastLabel) {
+         drawSegmentLabel(wi.segmentCtx, 512, currentLabel);
+         wi.segmentTexture.needsUpdate = true;
+         wi.lastLabel = currentLabel;
        }
        
-       const liveWx = (latestProps.current.weathersData && latestProps.current.weathersData[wi.nIdx]) || initWxFallback;
-       const liveCond = deriveWeatherVisual(liveWx).decalCondition;
-       wi.weatherMaterial.map = decalMats[liveCond].map;
+        // 2. Congestion stays billboarded; segment labels are fixed to the globe surface.
+        wi.congestionMesh.position.copy(wi.basePos);
+        wi.segmentMesh.position.copy(wi.segmentPos);
+        wi.congestionMesh.quaternion.copy(camera.quaternion);
+        wi.segmentMesh.quaternion.copy(wi.segmentQuat);
        
-       // 2. Static placement + billboard
-       wi.weatherMesh.position.copy(wi.basePos);
-       wi.congestionMesh.position.copy(wi.basePos);
-       wi.spacetimeMesh.position.copy(wi.basePos);
-       wi.weatherMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), wi.upDir);
-       wi.congestionMesh.quaternion.copy(camera.quaternion);
-       wi.spacetimeMesh.quaternion.copy(camera.quaternion);
-       
-       // 3. Direct crossfade between weather, congestion, and spacetime overlays
+       // 3. Direct crossfade between congestion and segment ownership overlays
        const iconOp = Math.max(0, Math.min(1, (dist - 4.5) / 2.0)) * 0.9;
        const currentMode = latestProps.current.viewMode;
        
        // 计算目标透明度
-       let targetWeatherOpacity = 0;
        let targetCongestionOpacity = 0;
-       let targetSpacetimeOpacity = 0;
+       let targetSegmentOpacity = 0;
        
-       if (currentMode === 'spacetime') {
-         // 时空模式：显示月份
-         targetSpacetimeOpacity = iconOp;
-       } else if (currentMode === 'congestion') {
+       if (currentMode === 'congestion') {
          // 拥堵模式：显示拥堵百分比
          targetCongestionOpacity = iconOp;
        } else {
-         // 天气模式：显示天气图标
-         targetWeatherOpacity = iconOp;
+         // 路段归属模式：显示路段名
+         targetSegmentOpacity = iconOp;
        }
        
        // 平滑过渡（使用 lerp 插值）
        const transitionSpeed = 0.12; // 过渡速度
-       wi.currentWeatherOpacity = THREE.MathUtils.lerp(wi.currentWeatherOpacity, targetWeatherOpacity, transitionSpeed);
        wi.currentCongestionOpacity = THREE.MathUtils.lerp(wi.currentCongestionOpacity, targetCongestionOpacity, transitionSpeed);
-       wi.currentSpacetimeOpacity = THREE.MathUtils.lerp(wi.currentSpacetimeOpacity, targetSpacetimeOpacity, transitionSpeed);
+       wi.currentSegmentOpacity = THREE.MathUtils.lerp(wi.currentSegmentOpacity, targetSegmentOpacity, transitionSpeed);
        
        // 应用透明度
-       wi.weatherMaterial.opacity = wi.currentWeatherOpacity;
        wi.congestionMaterial.opacity = wi.currentCongestionOpacity;
-       wi.spacetimeMaterial.opacity = wi.currentSpacetimeOpacity;
+       wi.segmentMaterial.opacity = wi.currentSegmentOpacity;
        
-       wi.weatherMesh.visible = wi.currentWeatherOpacity > 0.001;
        wi.congestionMesh.visible = wi.currentCongestionOpacity > 0.001;
-       wi.spacetimeMesh.visible = wi.currentSpacetimeOpacity > 0.001;
-    }
+       wi.segmentMesh.visible = wi.currentSegmentOpacity > 0.001;
+     }
 
     // 国界线亮度平滑过渡
     borderBrightness = THREE.MathUtils.lerp(borderBrightness, borderBrightnessTarget, 0.08);
@@ -1442,13 +1574,11 @@ function buildScene(
     nodeMat.dispose();
     focusRingGeo.dispose();
     focusRingMat.dispose();
-    Object.values(decalMats).forEach((mat) => mat.dispose());
-    for (const wi of weatherIcons) {
-      wi.weatherMaterial.dispose();
+    for (const wi of regionLabels) {
       wi.congestionMaterial.dispose();
       wi.congestionTexture.dispose();
-      wi.spacetimeMaterial.dispose();
-      wi.spacetimeTexture.dispose();
+      wi.segmentMaterial.dispose();
+      wi.segmentTexture.dispose();
     }
     atmGeo.dispose();
     atmMat.dispose();
@@ -1470,11 +1600,10 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   onToggleViewMode,
   graphData,
   globalLevels,
+  globalScores = [],
   selectedSensor,
   highlightedSensor = null,
-  viewMode = 'weather',
-  weather,
-  spacetimeMonths,
+  viewMode = 'congestion',
   sensorCount = 743,
   currentTimeIndex = 0,
   currentSimTime = null,
@@ -1482,35 +1611,32 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   previewSensor = null,
   previewTimeIndex = null,
   onPreviewChange,
+  selectedMonth,
+  selectedDay,
+  onDateChange,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
-
-  // Safely parse single or multiple weather packets
-  const weatherArr: WeatherData[] = useMemo(() => {
-    if (!weather) return [];
-    if (Array.isArray(weather)) return weather;
-    return [weather];
-  }, [weather]);
-  const baseSpacetimeMonths = useMemo(
-    () => spacetimeMonths || Array.from({ length: 12 }, (_, i) => i + 1),
-    [spacetimeMonths],
-  );
+  const sceneActiveRef = useRef(isOpen);
+  const maxTimeIndexRef = useRef(maxTimeIndex);
+  const [hasOpened, setHasOpened] = useState(isOpen);
 
   // Pass dynamic values through a mutable Ref to completely prevent expensive recreating of Three geometries & resetting OrbitCamera!
   const latestProps = useRef({
     selectedSensor,
     highlightedSensor,
     globalLevels,
-    weathersData: weatherArr,
+    globalScores,
     viewMode,
-    spacetimeMonths: baseSpacetimeMonths,
   });
 
   const [zoomLevel, setZoomLevel] = useState(0); // 0 (far) to 1 (near)
   const safeSensorCount = Math.max(1, Math.floor(sensorCount));
   const effectivePreviewSensor = previewSensor ?? highlightedSensor ?? selectedSensor;
   const effectivePreviewTime = previewTimeIndex ?? currentTimeIndex;
+  const effectivePreviewDate = selectedMonth !== undefined && selectedDay !== undefined
+    ? { month: clampMonth(selectedMonth), day: clampDay(selectedMonth, selectedDay) }
+    : tObsToMonthDay(effectivePreviewTime);
   const initialWidgetSensorId = clampSensorId(effectivePreviewSensor + 1, safeSensorCount);
   const [timeExpanded, setTimeExpanded] = useState(false);
   const [timeTargetExpanded, setTimeTargetExpanded] = useState(false);
@@ -1525,8 +1651,8 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const [sensorSliderWidth, setSensorSliderWidth] = useState(() =>
     sensorIdToWidth(initialWidgetSensorId, safeSensorCount),
   );
-  const [widgetMonth, setWidgetMonth] = useState(() => tObsToMonthDay(effectivePreviewTime).month);
-  const [widgetDay, setWidgetDay] = useState(() => tObsToMonthDay(effectivePreviewTime).day);
+  const [widgetMonth, setWidgetMonth] = useState(() => effectivePreviewDate.month);
+  const [widgetDay, setWidgetDay] = useState(() => effectivePreviewDate.day);
   const sensorInputRef = useRef<HTMLInputElement>(null);
   const sensorSliderRef = useRef<HTMLDivElement>(null);
   const sensorFillRef = useRef<HTMLDivElement>(null);
@@ -1545,13 +1671,22 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const sensorAnimationFrameRef = useRef<number | null>(null);
   const latestOnSelectSensorRef = useRef(onSelectSensor);
   const widgetSelectionRef = useRef({
-    month: tObsToMonthDay(effectivePreviewTime).month,
-    day: tObsToMonthDay(effectivePreviewTime).day,
+    month: effectivePreviewDate.month,
+    day: effectivePreviewDate.day,
   });
 
   useEffect(() => {
     latestOnSelectSensorRef.current = onSelectSensor;
   }, [onSelectSensor]);
+
+  useEffect(() => {
+    sceneActiveRef.current = isOpen;
+    if (isOpen) setHasOpened(true);
+  }, [isOpen]);
+
+  useEffect(() => {
+    maxTimeIndexRef.current = maxTimeIndex;
+  }, [maxTimeIndex]);
 
   const commitPreviewSelection = (sensorId = widgetSensorIdRef.current) => {
     if (!isOpen || !onPreviewChange) return;
@@ -1580,6 +1715,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     };
     setWidgetMonth((prev) => (prev === nextMonth ? prev : nextMonth));
     setWidgetDay((prev) => (prev === nextDay ? prev : nextDay));
+    onDateChange?.(nextMonth, nextDay);
   };
 
   const setWidgetDayImmediate = (day: number | ((prev: number) => number)) => {
@@ -1592,6 +1728,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       day: nextDay,
     };
     setWidgetDay((prev) => (prev === nextDay ? prev : nextDay));
+    onDateChange?.(widgetSelectionRef.current.month, nextDay);
   };
 
   const applySliderWidthOnly = (newWidth: number) => {
@@ -1682,7 +1819,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
 
   useEffect(() => {
     if (!isOpen) return;
-    const md = tObsToMonthDay(effectivePreviewTime);
+    const md = effectivePreviewDate;
     suppressPreviewCommitRef.current = true;
     widgetSelectionRef.current = {
       month: md.month,
@@ -1690,11 +1827,11 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     };
     setWidgetMonth((prev) => (prev === md.month ? prev : md.month));
     setWidgetDay((prev) => (prev === md.day ? prev : md.day));
-  }, [isOpen, effectivePreviewTime]);
+  }, [isOpen, effectivePreviewDate.month, effectivePreviewDate.day]);
 
   useEffect(() => {
     if (!isOpen || !suppressPreviewCommitRef.current) return;
-    const md = tObsToMonthDay(effectivePreviewTime);
+    const md = effectivePreviewDate;
     const expectedSensorId = clampSensorId(effectivePreviewSensor + 1, safeSensorCount);
     if (widgetMonth !== md.month || widgetDay !== md.day || widgetSensorId !== expectedSensorId) return;
     lastCommittedPreviewRef.current = {
@@ -1705,7 +1842,8 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   }, [
     isOpen,
     effectivePreviewSensor,
-    effectivePreviewTime,
+    effectivePreviewDate.month,
+    effectivePreviewDate.day,
     safeSensorCount,
     widgetMonth,
     widgetDay,
@@ -1980,55 +2118,25 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [graphData]);
 
-  const previewNation = useMemo(() => {
-    const sensorIdx = clampSensorId(widgetSensorId, safeSensorCount) - 1;
-    if (sensorIdx < 0) return -1;
-    return nations.findIndex((nation) => nation.childSensors.includes(sensorIdx));
-  }, [widgetSensorId, safeSensorCount, nations]);
-
-  const displaySpacetimeMonths = useMemo(() => {
-    if (previewNation < 0 || previewNation >= baseSpacetimeMonths.length) {
-      return baseSpacetimeMonths;
-    }
-    const anchorMonth = clampMonth(baseSpacetimeMonths[previewNation] ?? (previewNation + 1));
-    const delta = widgetMonth - anchorMonth;
-    return baseSpacetimeMonths.map((month) => wrapMonth(month + delta));
-  }, [baseSpacetimeMonths, previewNation, widgetMonth]);
-
   useEffect(() => {
     latestProps.current = {
       selectedSensor,
       highlightedSensor,
       globalLevels,
-      weathersData: weatherArr,
+      globalScores,
       viewMode,
-      spacetimeMonths: displaySpacetimeMonths,
     };
-  }, [selectedSensor, highlightedSensor, globalLevels, weatherArr, viewMode, displaySpacetimeMonths]);
+  }, [selectedSensor, highlightedSensor, globalLevels, globalScores, viewMode]);
 
   /* Build scene */
   useEffect(() => {
-    if (!isOpen || !canvasRef.current || nations.length === 0) {
-      if (isOpen && nations.length === 0) {
+    if (!hasOpened || !canvasRef.current || nations.length === 0) {
+      if (hasOpened && nations.length === 0) {
         console.warn('[NetworkSphere] Modal is open but nations are empty. graphData state:', !!graphData);
       }
       return;
     }
-    
-    // Use default weather if none provided
-    const effectiveWeather = weatherArr.length > 0 ? weatherArr : Array.from({ length: NUM_NATIONS }, (_, i) => ({
-      condition: 'Sunny',
-      precipitation_pct: 0,
-      cloudcover: 20,
-      wind_kmh: 10,
-      temp_c: 20,
-      humidity: 50,
-      month_index: i,
-    }));
-    
-    // Update latestProps with effective weather
-    latestProps.current.weathersData = effectiveWeather;
-
+    if (cleanupRef.current) return;
     const timer = setTimeout(() => {
       if (!canvasRef.current) return;
       
@@ -2052,9 +2160,10 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
           borderEdges,
           cellPolygons,
           latestProps,
+          sceneActiveRef,
           (sensorIdx) => {
             const { month, day } = widgetSelectionRef.current;
-            latestOnSelectSensorRef.current(sensorIdx, monthDayToTObs(month, day, DAY_START_SLOT, maxTimeIndex));
+            latestOnSelectSensorRef.current(sensorIdx, monthDayToTObs(month, day, DAY_START_SLOT, maxTimeIndexRef.current));
           },
           (dist: number) => {
             const z = THREE.MathUtils.clamp(
@@ -2078,13 +2187,41 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       cleanupRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, nations, maxTimeIndex]);
+  }, [hasOpened, nations]);
 
   // Which nation does the selected sensor belong to?
   const selectedNation = useMemo(() => {
      if (selectedSensor < 0) return -1;
      return nations.findIndex(n => n.childSensors.includes(selectedSensor));
   }, [selectedSensor, nations]);
+
+  const networkStripData = useMemo(() => {
+    return buildNetworkStripData(graphData, effectivePreviewSensor, globalScores, globalLevels);
+  }, [graphData, effectivePreviewSensor, globalScores, globalLevels]);
+
+  const handleNetworkStripSensorClick = (sensorIdx: number) => {
+    const nextSensorId = clampSensorId(sensorIdx + 1, safeSensorCount);
+    const nextWidth = sensorIdToWidth(nextSensorId, safeSensorCount);
+    widgetSensorIdRef.current = nextSensorId;
+    setWidgetSensorId((prev) => (prev === nextSensorId ? prev : nextSensorId));
+    sensorSliderWidthRef.current = nextWidth;
+    setSensorSliderWidth((prev) => (Math.abs(prev - nextWidth) < 0.1 ? prev : nextWidth));
+    if (!isSensorInputOpen) {
+      setSensorInputValue(String(nextSensorId));
+    }
+    commitPreviewSelection(nextSensorId);
+  };
+
+  const segmentLeaderboard = useMemo(() => {
+    return nations
+      .map((nation) => ({
+        nationIdx: nation.nationIdx,
+        label: nation.label,
+        percent: congestionPercentFromSensors(nation.childSensors, globalLevels, globalScores),
+        sensorCount: nation.childSensors.length,
+      }))
+      .sort((a, b) => b.percent - a.percent || b.sensorCount - a.sensorCount || a.label.localeCompare(b.label));
+  }, [nations, globalLevels, globalScores]);
   const visibleDayCount = getDaysInMonth(widgetMonth);
   const simTimeLabel = formatSimTimeLabel(currentSimTime);
 
@@ -2113,15 +2250,19 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     e.stopPropagation();
   };
 
+  const shouldRenderModal = isOpen || hasOpened;
+
   return (
     <AnimatePresence>
-      {isOpen && (
+      {shouldRenderModal && (
         <motion.div
           initial={{ opacity: 0, scale: 1.05 }}
-          animate={{ opacity: 1, scale: 1 }}
+          animate={isOpen ? { opacity: 1, scale: 1 } : { opacity: 0, scale: 0.98 }}
           exit={{ opacity: 0, scale: 0.98 }}
           transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
           className="fixed inset-0 z-50 flex items-center justify-center bg-[#050505] overflow-hidden"
+          style={{ pointerEvents: isOpen ? 'auto' : 'none' }}
+          aria-hidden={!isOpen}
           onContextMenu={swallowContextMenu}
         >
           {/* Vignette */}
@@ -2150,6 +2291,19 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
               {simTimeLabel}
             </div>
           </div>
+
+          <SegmentLeaderboardOverlay
+            items={segmentLeaderboard}
+            zoom={zoomLevel}
+            visible={viewMode === 'segment'}
+          />
+
+          <NetworkRelationStripOverlay
+            data={networkStripData}
+            zoom={zoomLevel}
+            visible={viewMode === 'congestion'}
+            onSensorClick={handleNetworkStripSensorClick}
+          />
 
           <div className="absolute right-6 bottom-6 z-[28] pointer-events-auto flex items-center gap-8">
             <div
@@ -2334,6 +2488,240 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   );
 };
 
+type SegmentLeaderboardItem = {
+  nationIdx: number;
+  label: string;
+  percent: number;
+  sensorCount: number;
+};
+
+type NetworkStripItem = {
+  sensorIdx: number;
+  absoluteIndex: number;
+  label: string;
+  absPm: number;
+  score?: number;
+  level?: number;
+  color: string;
+  isCurrent: boolean;
+  distance: number;
+};
+
+type NetworkStripData = {
+  freeway: string;
+  direction: string;
+  total: number;
+  position: number;
+  start: number;
+  end: number;
+  focusSensor: number;
+  currentName: string;
+  visible: NetworkStripItem[];
+};
+
+function stripWeight(distance: number) {
+  if (distance <= 0) return 7.2;
+  if (distance <= 1) return 3.2;
+  if (distance <= 2) return 1.85;
+  if (distance <= 3) return 1.12;
+  return 0.44;
+}
+
+const NetworkRelationStripOverlay: React.FC<{
+  data: NetworkStripData | null;
+  zoom: number;
+  visible: boolean;
+  onSensorClick?: (sensorIdx: number) => void;
+}> = ({ data, zoom, visible, onSensorClick }) => {
+  const cameraDistance = MAX_CAMERA_DISTANCE - zoom * (MAX_CAMERA_DISTANCE - MIN_CAMERA_DISTANCE);
+  const zoomOpacity = Math.max(0, Math.min(1, (cameraDistance - 4.5) / 2.0)) * 0.9;
+  const opacity = visible && data ? zoomOpacity : 0;
+  const interactive = opacity > 0.08;
+  const hiddenBefore = data ? data.start : 0;
+  const hiddenAfter = data ? Math.max(0, data.total - data.end) : 0;
+  const currentScore = data?.visible.find((item) => item.isCurrent)?.score;
+  const currentPercent = Number.isFinite(currentScore) ? Math.round(Number(currentScore) * 100) : null;
+
+  return (
+    <motion.aside
+      className="pointer-events-none absolute left-6 top-6 z-[29] text-white"
+      initial={false}
+      animate={{ opacity, y: visible ? 0 : -10 }}
+      transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+      aria-hidden={opacity <= 0.01}
+    >
+      <div className="flex items-start gap-5">
+        <div
+          className="flex h-[min(60vh,560px)] w-[38px] flex-col rounded-[2px] bg-white/[0.03] p-[3px] shadow-[0_24px_80px_rgba(0,0,0,0.42)] ring-1 ring-white/10 backdrop-blur-md"
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          {hiddenBefore > 0 && (
+            <div className="mb-1 flex h-5 shrink-0 items-center justify-center text-[9px] font-black tabular-nums text-white/38">
+              +{hiddenBefore}
+            </div>
+          )}
+          <div className="flex min-h-0 flex-1 flex-col">
+            {data?.visible.map((item) => {
+              const weight = stripWeight(item.distance);
+              const scoreOpacity = item.score === undefined ? 0.78 : 0.42 + item.score * 0.58;
+              return (
+                <button
+                  key={item.sensorIdx}
+                  type="button"
+                  className="relative w-full transition-[flex,opacity,margin] duration-300 ease-out"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onSensorClick?.(item.sensorIdx);
+                  }}
+                  title={`${item.absoluteIndex + 1} / ${data.total} · #${item.sensorIdx + 1} · ${Math.round((item.score ?? 0) * 100)}%`}
+                  style={{
+                    flex: weight,
+                    marginBottom: item.absoluteIndex === data.end - 1 ? 0 : Math.min(7, 1.5 + weight * 0.75),
+                    padding: 0,
+                    border: 0,
+                    background: 'transparent',
+                    cursor: 'pointer',
+                    pointerEvents: interactive ? 'auto' : 'none',
+                  }}
+                >
+                  <div
+                    className="h-full w-full transition-[box-shadow,filter,transform] duration-200 hover:brightness-125 active:scale-x-90"
+                    style={{
+                      backgroundColor: item.color,
+                      opacity: item.isCurrent ? 1 : scoreOpacity,
+                      boxShadow: item.isCurrent ? `0 0 18px ${item.color}` : 'none',
+                      outline: item.isCurrent ? '1px solid rgba(255,255,255,0.9)' : '1px solid rgba(255,255,255,0.06)',
+                      outlineOffset: item.isCurrent ? 1 : 0,
+                    }}
+                  />
+                </button>
+              );
+            })}
+          </div>
+          {hiddenAfter > 0 && (
+            <div className="mt-1 flex h-5 shrink-0 items-center justify-center text-[9px] font-black tabular-nums text-white/38">
+              +{hiddenAfter}
+            </div>
+          )}
+        </div>
+
+        <div className="mt-[-2px] w-[230px] select-none pointer-events-none">
+          {data && (
+            <>
+              <div className="text-[clamp(38px,5vw,70px)] font-black leading-[0.82] tracking-[-0.075em] text-white drop-shadow-[0_14px_38px_rgba(255,255,255,0.18)]">
+                {data.freeway} {data.direction}
+              </div>
+              <div className="mt-3 flex items-baseline gap-4 font-mono tabular-nums">
+                <div className="text-[28px] font-black leading-none text-white/88">
+                  {data.position}<span className="text-white/32">/{data.total}</span>
+                </div>
+                {currentPercent !== null && (
+                  <div className="text-[34px] font-black leading-none text-white">
+                    {currentPercent}%
+                  </div>
+                )}
+              </div>
+              <div className="mt-4 max-w-[220px] truncate text-[13px] font-black uppercase tracking-[0.14em] text-white/45">
+                #{data.focusSensor + 1} · {data.currentName}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </motion.aside>
+  );
+};
+
+const SegmentLeaderboardOverlay: React.FC<{
+  items: SegmentLeaderboardItem[];
+  zoom: number;
+  visible: boolean;
+}> = ({ items, zoom, visible }) => {
+  const rowHeight = 58;
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const cameraDistance = MAX_CAMERA_DISTANCE - zoom * (MAX_CAMERA_DISTANCE - MIN_CAMERA_DISTANCE);
+  const zoomOpacity = Math.max(0, Math.min(1, (cameraDistance - 4.5) / 2.0)) * 0.9;
+  const opacity = visible ? zoomOpacity : 0;
+  const interactive = opacity > 0.08;
+  const headIndex = Math.min(items.length - 1, Math.max(0, Math.round(scrollTop / rowHeight)));
+
+  const handleLeaderboardScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(event.currentTarget.scrollTop);
+  };
+
+  return (
+    <motion.aside
+      className="absolute left-6 top-6 z-[29] w-[min(520px,42vw)] max-w-[calc(100vw-3rem)] text-white"
+      initial={false}
+      animate={{ opacity, y: visible ? 0 : -10 }}
+      transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+      style={{ pointerEvents: interactive ? 'auto' : 'none' }}
+      aria-hidden={!interactive}
+    >
+      <div className="mb-5 flex items-end gap-4">
+        <div className="text-[10px] font-black uppercase tracking-[0.32em] text-white/35">Segment Load</div>
+        <div className="h-px flex-1 bg-gradient-to-r from-white/25 to-transparent" />
+      </div>
+
+      <div
+        ref={scrollRef}
+        className="max-h-[min(58vh,560px)] overflow-y-auto pr-5 [scrollbar-width:none] [-ms-overflow-style:none]"
+        onScroll={handleLeaderboardScroll}
+        onWheel={(event) => event.stopPropagation()}
+        onPointerDown={(event) => event.stopPropagation()}
+        onTouchMove={(event) => event.stopPropagation()}
+        style={{ WebkitOverflowScrolling: 'touch', scrollSnapType: 'y mandatory' }}
+      >
+        <div className="flex flex-col pb-6 [&::-webkit-scrollbar]:hidden">
+          {items.map((item, index) => {
+            const visualIndex = index - headIndex;
+            const isTop = visualIndex === 0;
+            const isAboveHead = visualIndex < 0;
+            const scale = isAboveHead ? 0.7 : Math.max(0.68, 1 - visualIndex * 0.06);
+            const rowOpacity = isAboveHead ? 0 : Math.max(0.26, 1 - visualIndex * 0.1);
+
+            return (
+              <button
+                key={item.nationIdx}
+                type="button"
+                className="group grid w-full grid-cols-[34px_minmax(0,1fr)_74px] items-baseline gap-4 text-left outline-none transition-[opacity,transform] duration-200 ease-out"
+                style={{
+                  height: rowHeight,
+                  transform: `scale(${scale})`,
+                  transformOrigin: 'left center',
+                  opacity: rowOpacity,
+                  pointerEvents: isAboveHead ? 'none' : 'auto',
+                  visibility: isAboveHead ? 'hidden' : 'visible',
+                  scrollSnapAlign: 'start',
+                  scrollSnapStop: 'always',
+                }}
+              >
+                <span
+                  className={`text-[18px] font-black tabular-nums ${isTop ? 'text-white' : 'text-white/35'}`}
+                >
+                  {index + 1}
+                </span>
+                <span
+                  className={`truncate text-[clamp(24px,3vw,42px)] font-black leading-[1.04] tracking-[-0.04em] transition-colors duration-200 group-hover:text-white ${isTop ? 'text-white drop-shadow-[0_8px_28px_rgba(255,255,255,0.18)]' : 'text-white/40'}`}
+                >
+                  {item.label}
+                </span>
+                <span
+                  className={`text-right text-[22px] font-black tabular-nums ${isTop ? 'text-white' : 'text-white/40'}`}
+                >
+                  {item.percent}%
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </motion.aside>
+  );
+};
+
 /* ══════════════════════════════════════════════════════════════
    2D Mode Switch Overlay (Peripheral Arcs)
    ══════════════════════════════════════════════════════════════ */
@@ -2371,8 +2759,7 @@ const ModeSwitchOverlay: React.FC<{ mode: PanoramaMode; zoom: number }> = ({ mod
     }
   }, [mode, displayMode]);
 
-  const labelText = displayMode === 'weather' ? '天气环境扫描' : 
-                    displayMode === 'congestion' ? '交通流量监控' : '时空月份数据';
+  const labelText = displayMode === 'congestion' ? '交通流量监控' : '路段归属扫描';
   const displayString = labelText;
 
   // Adaptive Curvature Logic:
