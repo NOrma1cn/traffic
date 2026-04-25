@@ -54,13 +54,10 @@ const ledTransitionShaderChunk = `
 
     float ledMask = smoothstep(0.50, 0.16, diodeDist);
     float ledGlow = smoothstep(0.62, 0.0, diodeDist) * 0.055;
-    float finalMask = mix(1.0, 0.30 + ledMask * 0.62, u_transition);
     float finalGlow = mix(0.0, ledGlow, u_transition);
 
-    vec3 litColor = baseColor * mix(1.0, 0.88, u_transition);
-    vec3 bgColor = vec3(0.05, 0.055, 0.07);
-    vec3 diodeFloor = mix(baseColor * 0.94, bgColor + baseColor * 0.1, u_transition);
-    vec3 finalColor = mix(diodeFloor, litColor * (0.96 + finalGlow), finalMask);
+    float diodeMask = mix(1.0, 0.82 + ledMask * 0.22 + finalGlow, u_transition);
+    vec3 finalColor = baseColor * diodeMask;
 
     // Prevent highlight channel clipping from washing hues to white in LED mode.
     // (If values exceed 1.0, scale down proportionally to preserve chroma.)
@@ -69,10 +66,6 @@ const ledTransitionShaderChunk = `
       if (maxC > 1.0) finalColor /= maxC;
     }
 
-    vec2 uv = fragCoord / u_resolution.xy;
-    float vignette = uv.x * uv.y * (1.0 - uv.x) * (1.0 - uv.y);
-    vignette = clamp(pow(16.0 * vignette, 0.2), 0.0, 1.0);
-    finalColor *= mix(1.0, 0.92 + vignette * 0.08, u_transition);
     finalColor *= mix(1.0, 0.78, u_transition);
 
     return finalColor;

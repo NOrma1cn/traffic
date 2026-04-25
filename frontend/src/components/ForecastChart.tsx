@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { Route } from 'lucide-react';
 import type { IncidentContext, IncidentEvent } from './IncidentStatusPanel';
 
 interface ForecastChartPoint {
@@ -8,22 +9,11 @@ interface ForecastChartPoint {
   predicted: number | null;
 }
 
-interface DayData {
-  day: string;
-  date: string;
-  data: number[];
-  isToday: boolean;
-}
-
 interface ForecastChartProps {
   data: ForecastChartPoint[];
   predictionStartIdx: number;
   metricLabel: string;
   unit: string;
-  referenceValue?: number;
-  referenceLabel?: string;
-  multiDayData?: DayData[];
-  weeklyTimes?: string[];
   // 同步相关
   syncX?: number | null;
   onSyncX?: (x: number | null) => void;
@@ -33,9 +23,8 @@ interface ForecastChartProps {
   branchPredicted?: number[];
   branchLabel?: string;
   accidents?: IncidentContext | null;
+  onOpenNetworkSphere?: () => void;
 }
-
-type ViewMode = 'timeline' | 'weekly';
 
 type IncidentTheme = {
   iconClass: string;
@@ -237,6 +226,22 @@ const formatXAxisLabel = (value: string, prevValue?: string) => {
   return time;
 };
 
+const formatChartDateTime = (value?: string) => {
+  const parsed = value ? parseTimeMs(value) : null;
+  const date = new Date(parsed ?? Date.now());
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const min = String(date.getMinutes()).padStart(2, '0');
+  const weekday = date.toLocaleDateString('zh-CN', { weekday: 'long' });
+  return {
+    date: `${yyyy}-${mm}-${dd}`,
+    time: `${hh}:${min}`,
+    weekday,
+  };
+};
+
 /**
  * 生成平滑的 SVG 路径 (Simple Bezier approximation)
  */
@@ -258,10 +263,6 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
   data,
   predictionStartIdx,
   unit,
-  referenceValue,
-  referenceLabel,
-  multiDayData,
-  weeklyTimes,
   syncX,
   onSyncX,
   compact = false,
@@ -269,13 +270,13 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
   forcedMax,
   branchPredicted,
   accidents,
+  onOpenNetworkSphere,
 }) => {
   const svgHostRef = React.useRef<HTMLDivElement | null>(null);
   const svgRef = React.useRef<SVGSVGElement | null>(null);
-  const [svgHostWidth, setSvgHostWidth] = useState<number | null>(null);
+  const [svgHostSize, setSvgHostSize] = useState<{ width: number; height: number } | null>(null);
   const uid = React.useId().replace(/:/g, '');
   const readoutClipId = `fc-readout-clip-${uid}`;
-  const [viewMode, setViewMode] = useState<ViewMode>('timeline');
   const [internalHoveredPoint, setInternalHoveredPoint] = useState<any>(null);
   const [hoveredIncidentId, setHoveredIncidentId] = useState<string | null>(null);
   const isPercentScale = unit.includes('%');
@@ -286,9 +287,12 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
     if (!el) return;
 
     const update = () => {
-      const rect = el.getBoundingClientRect();
-      const next = Math.max(1, Math.round(rect.width));
-      setSvgHostWidth(next);
+      const nextWidth = Math.max(1, el.clientWidth || el.offsetWidth || Math.round(el.getBoundingClientRect().width));
+      const nextHeight = Math.max(1, el.clientHeight || el.offsetHeight || Math.round(el.getBoundingClientRect().height));
+      setSvgHostSize((prev) => {
+        if (prev && prev.width === nextWidth && prev.height === nextHeight) return prev;
+        return { width: nextWidth, height: nextHeight };
+      });
     };
 
     update();
@@ -332,46 +336,30 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
       return;
     }
 
-    const total = viewMode === 'timeline' ? data.length : weeklySeries[0]?.data.length || 1;
+    const total = data.length;
     const chartWidth = width - padding.left - padding.right;
     const rawIdx = ((mouseX - padding.left) / chartWidth) * (total - 1);
     const idx = Math.max(0, Math.min(total - 1, Math.round(rawIdx)));
 
     if (idx >= 0 && idx < total) {
-      if (viewMode === 'timeline') {
-        const floorIdx = Math.floor(Math.max(0, Math.min(total - 2, rawIdx)));
-        const ceilIdx = floorIdx + 1;
-        const ratio = rawIdx - floorIdx;
-        const pBefore = data[floorIdx];
-        const pAfter = data[ceilIdx] || pBefore;
-        const valBefore = normalizeMetricValue(pBefore.observed ?? pBefore.predicted ?? 0);
-        const valAfter = normalizeMetricValue(pAfter.observed ?? pAfter.predicted ?? 0);
-        const interpolatedVal = normalizeMetricValue(valBefore + (valAfter - valBefore) * ratio);
-        const isPredictedSegment = rawIdx > predictionStartIdx;
+      const floorIdx = Math.floor(Math.max(0, Math.min(total - 2, rawIdx)));
+      const ceilIdx = floorIdx + 1;
+      const ratio = rawIdx - floorIdx;
+      const pBefore = data[floorIdx];
+      const pAfter = data[ceilIdx] || pBefore;
+      const valBefore = normalizeMetricValue(pBefore.observed ?? pBefore.predicted ?? 0);
+      const valAfter = normalizeMetricValue(pAfter.observed ?? pAfter.predicted ?? 0);
+      const interpolatedVal = normalizeMetricValue(valBefore + (valAfter - valBefore) * ratio);
+      const isPredictedSegment = rawIdx > predictionStartIdx;
 
-        setInternalHoveredPoint({
-          ...data[idx],
-          x: mouseX,
-          y: getY(interpolatedVal),
-          displayValue: interpolatedVal.toFixed(1),
-          seriesColor: isPredictedSegment ? '#10b981' : '#00e5ff',
-          seriesLabel: isPredictedSegment ? '预测曲线' : '观测曲线',
-        });
-      } else {
-        const seriesData = weeklySeries.map(day => ({
-          label: day.isToday ? '今天' : day.day, // 后续会计算 'X天前'
-          date: day.date,
-          value: normalizeMetricValue(day.data[idx]),
-          isToday: day.isToday
-        }));
-
-        setInternalHoveredPoint({ 
-          time: weeklyTimes?.[idx] || `Step ${idx}`, 
-          x: mouseX, 
-          isWeekly: true,
-          series: seriesData
-        });
-      }
+      setInternalHoveredPoint({
+        ...data[idx],
+        x: mouseX,
+        y: getY(interpolatedVal),
+        displayValue: interpolatedVal.toFixed(1),
+        seriesColor: isPredictedSegment ? '#10b981' : '#00e5ff',
+        seriesLabel: isPredictedSegment ? '预测曲线' : '观测曲线',
+      });
     }
   };
 
@@ -412,16 +400,11 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
     }));
   }, [branchPredicted, chartData, isPercentScale]);
 
-  const weeklySeries = useMemo(() => (multiDayData ?? []).filter(d => d.data.length > 0), [multiDayData]);
-
   // --- 缩放与布局逻辑 ---
   const { minVal, range, width, height, padding, yTicks, yTickStep } = useMemo(() => {
-    const allY = viewMode === 'timeline'
-      ? [...chartData.observed, ...chartData.predicted, ...branchSeries].map(p => p.y)
-      : weeklySeries.flatMap(d => d.data.map(normalizeMetricValue));
+    const allY = [...chartData.observed, ...chartData.predicted, ...branchSeries].map(p => p.y);
 
-    const referenceAxisValue = typeof referenceValue === 'number' && Number.isFinite(referenceValue) ? normalizeMetricValue(referenceValue) : null;
-    const axisValues = [...allY.filter(Number.isFinite), ...(referenceAxisValue === null ? [] : [referenceAxisValue])];
+    const axisValues = allY.filter(Number.isFinite);
     const rawMin = axisValues.length ? Math.min(...axisValues) : 0;
     const rawMax = axisValues.length ? Math.max(...axisValues) : 1;
     const pad = Math.max((rawMax - rawMin) * 0.16, Math.abs(rawMax) * 0.03, 1);
@@ -442,13 +425,14 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
 
     const baseHeight = compact ? 360 : 520;
     const fallbackWidth = compact ? 1000 : 1160;
-    const measuredWidth = svgHostWidth ?? fallbackWidth;
+    const measuredWidth = svgHostSize?.width ?? fallbackWidth;
+    const measuredHeight = svgHostSize?.height ?? baseHeight;
 
     return {
       minVal: finalMin,
       range: (finalMax - finalMin) || 1,
       width: measuredWidth,
-      height: baseHeight,
+      height: measuredHeight,
       padding: compact
         ? { top: 48, bottom: 56, left: 76, right: 52 }
         : { top: 64, bottom: 78, left: 100, right: 56 },
@@ -458,7 +442,7 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
       ),
       yTickStep: scale.step,
     };
-  }, [chartData, weeklySeries, viewMode, referenceValue, forcedMax, branchSeries, compact, svgHostWidth, isPercentScale]);
+  }, [chartData, forcedMax, branchSeries, compact, svgHostSize, isPercentScale]);
 
   const getY = (val: number) => {
     const safeVal = normalizeMetricValue(val);
@@ -472,24 +456,12 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
   const predictedPathPoints = chartData.predicted.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
   const branchPathPoints = branchSeries.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
 
-  const timelineVisible = viewMode === 'timeline';
   const xTickIndexes = useMemo(() => {
-    const total = timelineVisible ? data.length : (weeklyTimes?.length ?? 0);
-    return getTickIndexes(total, plotWidth);
-  }, [data.length, weeklyTimes?.length, timelineVisible, plotWidth]);
+    return getTickIndexes(data.length, plotWidth);
+  }, [data.length, plotWidth]);
 
   const hoverReadout = useMemo(() => {
     if (!hoveredPoint) return null;
-
-    if (hoveredPoint.isWeekly) {
-      const activeSeries = hoveredPoint.series?.find((s: any) => s.isToday) ?? hoveredPoint.series?.[0];
-      const value = typeof activeSeries?.value === 'number' ? activeSeries.value.toFixed(1) : '--';
-      return {
-        value,
-        caption: activeSeries?.label ? `${hoveredPoint.time} / ${activeSeries.label}` : hoveredPoint.time,
-        color: activeSeries?.isToday ? '#00e5ff' : '#cbd5e1',
-      };
-    }
 
     return {
       value: hoveredPoint.displayValue ?? '--',
@@ -499,11 +471,14 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
   }, [hoveredPoint]);
 
   const incidentZones = useMemo(() => {
-    if (!timelineVisible || !accidents?.current_events?.length || data.length < 2) return [] as ChartIncidentZone[];
+    if (!accidents?.current_events?.length || data.length < 2) return [] as ChartIncidentZone[];
 
     const stepMinutes = Math.max(1, inferStepMinutes(data.map((point) => point.time)));
     const baseSimTime = parseTimeMs(simTime ?? '');
     const timelineMs = data.map((point) => parseTimeMs(point.time));
+    const visibleWindowEndMs = baseSimTime === null
+      ? null
+      : baseSimTime + Math.max(0, data.length - 1 - predictionStartIdx) * stepMinutes * 60000;
 
     return accidents.current_events.flatMap((event, index) => {
       const theme = getIncidentTheme(event);
@@ -513,6 +488,12 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
       const absoluteEndMs = parseTimeMs(event.debug_end_time ?? '');
       const hasAbsoluteWindow = absoluteStartMs !== null && absoluteEndMs !== null && absoluteEndMs > absoluteStartMs;
       const hasSimAnchoredWindow = hasAbsoluteWindow && baseSimTime !== null;
+
+      if (hasAbsoluteWindow) {
+        if (baseSimTime !== null && absoluteEndMs <= baseSimTime) return [];
+        if (visibleWindowEndMs !== null && absoluteStartMs >= visibleWindowEndMs) return [];
+      }
+
       const durationGuess = Math.max(
         toFiniteNumber(event.duration_minutes) ?? Math.round(stepMinutes * (4 + severity * 2.5)),
         stepMinutes * 2,
@@ -591,7 +572,7 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
         })),
       }];
     });
-  }, [timelineVisible, accidents, data, predictionStartIdx, simTime, compact, plotHeight, padding.left, padding.right, width]);
+  }, [accidents, data, predictionStartIdx, simTime, compact, plotHeight, padding.left, padding.right, width]);
 
   const hoveredIncident = useMemo(
     () => incidentZones.find((zone) => zone.id === hoveredIncidentId) ?? null,
@@ -599,10 +580,10 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
   );
 
   React.useEffect(() => {
-    if (!timelineVisible || !incidentZones.some((zone) => zone.id === hoveredIncidentId)) {
+    if (!incidentZones.some((zone) => zone.id === hoveredIncidentId)) {
       setHoveredIncidentId(null);
     }
-  }, [timelineVisible, incidentZones, hoveredIncidentId]);
+  }, [incidentZones, hoveredIncidentId]);
 
   return (
     <motion.div
@@ -684,24 +665,26 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
         }
       `}</style>
 
-      <div className="flex justify-end p-7 pb-2">
-        <div className="relative z-50 pointer-events-auto flex items-center gap-1 bg-zinc-900/50 p-1 rounded-xl border border-white/5 self-start md:self-center">
-          {(['timeline', 'weekly'] as const).map((mode) => (
-            <button
-              key={mode}
-              onClick={() => setViewMode(mode)}
-              className={`px-4 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all duration-300 cursor-pointer active:scale-95 ${
-                viewMode === mode ? 'bg-white text-zinc-950' : 'text-zinc-400 hover:text-zinc-200'
-              }`}
-            >
-              {mode === 'timeline' ? '实时轨迹' : '周期对比'}
-            </button>
-          ))}
-        </div>
-      </div>
-
       <div ref={svgHostRef} className={`${compact ? 'h-[360px]' : 'h-[520px]'} relative w-full overflow-hidden`}>
-        {timelineVisible && hoveredIncident && (
+        {onOpenNetworkSphere && (
+          <button
+            type="button"
+            onClick={onOpenNetworkSphere}
+            className="pointer-events-auto absolute z-20 inline-flex h-14 items-center gap-3 rounded-[18px] border border-cyan-300/20 bg-black/45 px-5 text-left text-white shadow-[0_14px_50px_rgba(0,0,0,0.35)] backdrop-blur-xl transition hover:border-cyan-300/45 hover:bg-cyan-500/12 active:scale-[0.98]"
+            aria-label="打开路网星图"
+            style={{ left: Math.max(12, padding.left - 6), top: Math.max(0, padding.top - 16), transform: 'translateY(-100%)' }}
+          >
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-cyan-300/25 bg-cyan-400/10 text-cyan-200">
+              <Route size={18} />
+            </div>
+            <div className="flex flex-col">
+              <span className="text-[10px] font-black uppercase tracking-[0.22em] text-cyan-200/55">Road Network</span>
+              <span className="text-sm font-black tracking-[0.08em] text-white/92">打开路网星图</span>
+            </div>
+          </button>
+        )}
+
+        {hoveredIncident && (
           <div
             className="pointer-events-none absolute z-20"
             style={{
@@ -775,10 +758,10 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
                   y={y}
                   fill="currentColor"
                   className={isMajor
-                    ? 'text-zinc-50 font-mono text-[22px] font-black'
+                    ? 'text-zinc-50 font-mono text-[26px] font-black'
                     : isMid
-                      ? 'text-zinc-200 font-mono text-[15px] font-black'
-                    : 'text-zinc-300 font-mono text-[13px] font-bold'
+                      ? 'text-zinc-200 font-mono text-[18px] font-black'
+                    : 'text-zinc-300 font-mono text-[15px] font-bold'
                   }
                   textAnchor="end" dominantBaseline="middle"
                 >
@@ -789,95 +772,48 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
           })}
 
           {/* 横坐标标签 */}
-          {timelineVisible ? (
-            data.length > 0 && xTickIndexes.map((idx) => {
-              const x = getX(idx, data.length);
-              const isMajor = idx === 0 || idx === data.length - 1 || idx === Math.floor(data.length / 2);
-              const prevValue = (() => {
-                const listIdx = xTickIndexes.indexOf(idx);
-                const prevIdx = listIdx > 0 ? xTickIndexes[listIdx - 1] : undefined;
-                return prevIdx === undefined ? undefined : data[prevIdx]?.time;
-              })();
-              const label = formatXAxisLabel(data[idx].time, prevValue);
-              return (
-                <g key={idx}>
-                  {isMajor && (
-                    <line
-                      x1={x}
-                      y1={padding.top}
-                      x2={x}
-                      y2={height - padding.bottom}
-                      stroke="currentColor"
-                      className="text-zinc-800/45"
-                      strokeWidth="1"
-                      strokeDasharray="2 14"
-                    />
-                  )}
-                  <line x1={x} y1={height - padding.bottom} x2={x} y2={height - padding.bottom + (isMajor ? 10 : 6)} stroke="currentColor" className={isMajor ? 'text-zinc-500/85' : 'text-zinc-700/80'} strokeWidth={isMajor ? 1.6 : 1} />
-                  <text
-                    x={x} y={height - padding.bottom + 34}
-                    fill="currentColor"
-                    className={isMajor
-                      ? 'text-zinc-200 font-mono text-[14px] font-black uppercase tracking-wider'
-                      : 'text-zinc-400 font-mono text-[12px] font-bold uppercase tracking-wider'
-                    }
-                    textAnchor="middle"
-                  >
-                    {label}
-                  </text>
-                </g>
-              );
-            })
-          ) : (
-            weeklyTimes && weeklyTimes.length > 0 && xTickIndexes.map((idx) => {
-              const x = getX(idx, weeklyTimes.length);
-              const isMajor = idx === 0 || idx === weeklyTimes.length - 1 || idx === Math.floor(weeklyTimes.length / 2);
-              return (
-                <g key={idx}>
-                  {isMajor && (
-                    <line
-                      x1={x}
-                      y1={padding.top}
-                      x2={x}
-                      y2={height - padding.bottom}
-                      stroke="currentColor"
-                      className="text-zinc-800/45"
-                      strokeWidth="1"
-                      strokeDasharray="2 14"
-                    />
-                  )}
-                  <line x1={x} y1={height - padding.bottom} x2={x} y2={height - padding.bottom + (isMajor ? 10 : 6)} stroke="currentColor" className={isMajor ? 'text-zinc-500/85' : 'text-zinc-700/80'} strokeWidth={isMajor ? 1.6 : 1} />
-                  <text
-                    x={x} y={height - padding.bottom + 34}
-                    fill="currentColor"
-                    className={isMajor
-                      ? 'text-zinc-200 font-mono text-[14px] font-black uppercase tracking-widest'
-                      : 'text-zinc-400 font-mono text-[12px] font-bold uppercase tracking-widest'
-                    }
-                    textAnchor="middle"
-                  >
-                    {weeklyTimes[idx]}
-                  </text>
-                </g>
-              );
-            })
-          )}
+          {data.length > 0 && xTickIndexes.map((idx) => {
+            const x = getX(idx, data.length);
+            const isMajor = idx === 0 || idx === data.length - 1 || idx === Math.floor(data.length / 2);
+            const prevValue = (() => {
+              const listIdx = xTickIndexes.indexOf(idx);
+              const prevIdx = listIdx > 0 ? xTickIndexes[listIdx - 1] : undefined;
+              return prevIdx === undefined ? undefined : data[prevIdx]?.time;
+            })();
+            const label = formatXAxisLabel(data[idx].time, prevValue);
+            return (
+              <g key={idx}>
+                {isMajor && (
+                  <line
+                    x1={x}
+                    y1={padding.top}
+                    x2={x}
+                    y2={height - padding.bottom}
+                    stroke="currentColor"
+                    className="text-zinc-800/45"
+                    strokeWidth="1"
+                    strokeDasharray="2 14"
+                  />
+                )}
+                <line x1={x} y1={height - padding.bottom} x2={x} y2={height - padding.bottom + (isMajor ? 12 : 7)} stroke="currentColor" className={isMajor ? 'text-zinc-500/85' : 'text-zinc-700/80'} strokeWidth={isMajor ? 1.6 : 1} />
+                <text
+                  x={x} y={height - padding.bottom + 38}
+                  fill="currentColor"
+                  className={isMajor
+                    ? 'text-zinc-200 font-mono text-[17px] font-black uppercase tracking-wider'
+                    : 'text-zinc-400 font-mono text-[14px] font-bold uppercase tracking-wider'
+                  }
+                  textAnchor="middle"
+                >
+                  {label}
+                </text>
+              </g>
+            );
+          })}
 
           {/* 增加坐标轴基准线 */}
           <line x1={padding.left} y1={height - padding.bottom} x2={width - padding.right} y2={height - padding.bottom} stroke="#52525b" strokeWidth="1.5" />
           <line x1={padding.left} y1={padding.top} x2={padding.left} y2={height - padding.bottom} stroke="#52525b" strokeWidth="1.5" />
-
-          {referenceValue !== undefined && timelineVisible && (
-            <motion.g initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-              <line 
-                x1={padding.left} y1={getY(referenceValue)} 
-                x2={width - padding.right} y2={getY(referenceValue)} 
-                stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="6 6" opacity="0.4"
-              />
-              <rect x={width - padding.right - 80} y={getY(referenceValue) - 20} width="80" height="16" fill="#f59e0b" opacity="0.1" rx="4" />
-              <text x={width - padding.right - 8} y={getY(referenceValue) - 8} fill="#f59e0b" fontSize="9" fontWeight="900" textAnchor="end" className="uppercase tracking-[0.1em]">{referenceLabel}</text>
-            </motion.g>
-          )}
 
           <AnimatePresence>
             {hoverReadout && (
@@ -931,8 +867,7 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
           </AnimatePresence>
 
           <AnimatePresence mode="wait">
-            {timelineVisible ? (
-              <motion.g key="timeline" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}>
+            <motion.g key="timeline" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}>
                 <motion.path 
                   initial={{ d: `${getSmoothPath(observedPathPoints)} L ${observedPathPoints[observedPathPoints.length - 1]?.x},${height - padding.bottom} L ${padding.left},${height - padding.bottom} Z` }}
                   animate={{ d: `${getSmoothPath(observedPathPoints)} L ${observedPathPoints[observedPathPoints.length - 1]?.x},${height - padding.bottom} L ${padding.left},${height - padding.bottom} Z` }}
@@ -981,15 +916,7 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
                     className={i === observedPathPoints.length - 1 ? "drop-shadow-[0_0_12px_rgba(255,255,255,0.8)]" : ""}
                   />
                 ))}
-              </motion.g>
-            ) : (
-              <motion.g key="weekly" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}>
-                {weeklySeries.map((day, idx) => {
-                  const points = day.data.map((v, i) => ({ x: getX(i, day.data.length), y: getY(v) }));
-                  return <motion.path key={day.day} initial={{ pathLength: 0, opacity: 0 }} animate={{ pathLength: 1, opacity: day.isToday ? 1 : 0.15 }} transition={{ duration: 1.5, delay: idx * 0.08, ease: [0.16, 1, 0.3, 1] }} d={getSmoothPath(points)} fill="none" stroke={day.isToday ? "#00e5ff" : "#cbd5e1"} strokeWidth={day.isToday ? "4" : "1.5"} strokeLinecap="round" />;
-                })}
-              </motion.g>
-            )}
+            </motion.g>
           </AnimatePresence>
 
           <rect
@@ -1003,7 +930,7 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
           )}
         </svg>
 
-        {timelineVisible && incidentZones.length > 0 && (
+        {incidentZones.length > 0 && (
           <div className="pointer-events-none absolute inset-0 z-10">
             {incidentZones.map((zone) => {
               const zoneStyle = {

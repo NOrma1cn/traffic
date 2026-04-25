@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { Cloud, CloudDrizzle, CloudFog, CloudLightning, CloudRain, CloudSun, Sun, Wind } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import * as THREE from 'three';
 import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
 // @ts-ignore
@@ -31,6 +33,10 @@ interface NetworkSphereModalProps {
   selectedMonth?: number;
   selectedDay?: number;
   onDateChange?: (month: number, day: number) => void;
+  weatherCondition?: string;
+  weatherLabel?: string;
+  weatherTempC?: number;
+  weatherPrecipitationPct?: number;
 }
 
 export interface RegionNation {
@@ -88,18 +94,6 @@ function clampDay(month: number, day: number) {
 
 function getDaysInMonth(month: number) {
   return DAYS_IN_MONTH_2023[clampMonth(month) - 1] ?? 31;
-}
-
-function formatSimTimeLabel(simTime?: string | null) {
-  if (!simTime) return '--';
-  const date = new Date(simTime);
-  if (Number.isNaN(date.getTime())) return simTime;
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  const hh = String(date.getHours()).padStart(2, '0');
-  const min = String(date.getMinutes()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
 }
 
 function tObsToMonthDay(tObs: number): { month: number; day: number } {
@@ -281,6 +275,46 @@ function scoreToStripColor(score: number | undefined, level: number | undefined)
   if (resolvedLevel >= 2) return '#ff8a2a';
   if (resolvedLevel >= 1) return '#ffcc00';
   return '#0a84ff';
+}
+
+function getWeatherIcon(condition?: string): LucideIcon {
+  switch (condition) {
+    case 'PartlyCloudy':
+      return CloudSun;
+    case 'Overcast':
+      return Cloud;
+    case 'Foggy':
+      return CloudFog;
+    case 'Drizzle':
+      return CloudDrizzle;
+    case 'Rainy':
+      return CloudRain;
+    case 'Stormy':
+      return CloudLightning;
+    case 'Windy':
+      return Wind;
+    default:
+      return Sun;
+  }
+}
+
+function getWeatherAccent(condition?: string) {
+  switch (condition) {
+    case 'Stormy':
+      return '#a78bfa';
+    case 'Rainy':
+    case 'Drizzle':
+      return '#38bdf8';
+    case 'Foggy':
+      return '#67e8f9';
+    case 'Overcast':
+    case 'PartlyCloudy':
+      return '#94a3b8';
+    case 'Windy':
+      return '#22d3ee';
+    default:
+      return '#fbbf24';
+  }
 }
 
 function buildNetworkStripData(
@@ -1614,6 +1648,10 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   selectedMonth,
   selectedDay,
   onDateChange,
+  weatherCondition,
+  weatherLabel,
+  weatherTempC,
+  weatherPrecipitationPct,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
@@ -1641,7 +1679,6 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const [timeExpanded, setTimeExpanded] = useState(false);
   const [timeTargetExpanded, setTimeTargetExpanded] = useState(false);
   const [timeAnimating, setTimeAnimating] = useState(false);
-  const [fps, setFps] = useState(0);
   const [dotProgress, setDotProgress] = useState<number[]>(() => Array(12).fill(0));
   const [widgetSensorId, setWidgetSensorId] = useState(() => initialWidgetSensorId);
   const [isSensorInputOpen, setIsSensorInputOpen] = useState(false);
@@ -1669,6 +1706,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const sensorSliderWidthRef = useRef(sensorIdToWidth(initialWidgetSensorId, safeSensorCount));
   const widgetSensorIdRef = useRef(initialWidgetSensorId);
   const sensorAnimationFrameRef = useRef<number | null>(null);
+  const sensorAnimationActiveRef = useRef(false);
   const latestOnSelectSensorRef = useRef(onSelectSensor);
   const widgetSelectionRef = useRef({
     month: effectivePreviewDate.month,
@@ -1749,6 +1787,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       cancelAnimationFrame(sensorAnimationFrameRef.current);
       sensorAnimationFrameRef.current = null;
     }
+    sensorAnimationActiveRef.current = false;
   };
 
   const beginSensorDrag = (clientX: number, startWidth: number) => {
@@ -1762,41 +1801,35 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     targetWidth: number,
     duration = SENSOR_WIDGET_ANIMATION_MS,
     lockedSensorId?: number,
+    onComplete?: (sensorId: number) => void,
   ) => {
     const clampedTarget = Math.max(SENSOR_WIDGET_MIN_WIDTH, Math.min(SENSOR_WIDGET_MAX_WIDTH, targetWidth));
     stopSensorAnimation();
+    sensorAnimationActiveRef.current = true;
 
     const startWidth = sensorSliderWidthRef.current;
     const distance = clampedTarget - startWidth;
     let startTime: number | null = null;
 
-    if (lockedSensorId !== undefined) {
-      widgetSensorIdRef.current = lockedSensorId;
-      setWidgetSensorId((prev) => (prev === lockedSensorId ? prev : lockedSensorId));
-      if (!isSensorInputOpen) {
-        setSensorInputValue(String(lockedSensorId));
-      }
-    }
-
     const step = (timestamp: number) => {
       if (startTime === null) startTime = timestamp;
       const progress = Math.min((timestamp - startTime) / Math.max(1, duration), 1);
       const nextWidth = startWidth + distance * easeOutQuart(progress);
-      if (lockedSensorId !== undefined) {
-        applySliderWidthOnly(nextWidth);
-      } else {
-        applySensorWidth(nextWidth);
-      }
+      applySensorWidth(nextWidth);
 
       if (progress < 1) {
         sensorAnimationFrameRef.current = requestAnimationFrame(step);
       } else {
         sensorAnimationFrameRef.current = null;
-        if (lockedSensorId !== undefined) {
-          applySliderWidthOnly(clampedTarget);
-        } else {
-          applySensorWidth(clampedTarget);
+        applySensorWidth(clampedTarget);
+        const finalSensorId = lockedSensorId ?? widthToSensorId(clampedTarget, safeSensorCount);
+        widgetSensorIdRef.current = finalSensorId;
+        setWidgetSensorId((prev) => (prev === finalSensorId ? prev : finalSensorId));
+        if (!isSensorInputOpen) {
+          setSensorInputValue(String(finalSensorId));
         }
+        sensorAnimationActiveRef.current = false;
+        onComplete?.(finalSensorId);
       }
     };
 
@@ -1807,7 +1840,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     if (!isOpen) return;
     const nextSensorId = clampSensorId(effectivePreviewSensor + 1, safeSensorCount);
     const nextWidth = sensorIdToWidth(nextSensorId, safeSensorCount);
-    if (sensorDragActiveRef.current) return;
+    if (sensorDragActiveRef.current || sensorAnimationActiveRef.current) return;
     widgetSensorIdRef.current = nextSensorId;
     setWidgetSensorId((prev) => (prev === nextSensorId ? prev : nextSensorId));
     sensorSliderWidthRef.current = nextWidth;
@@ -1860,7 +1893,6 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
 
   useEffect(() => {
     if (isOpen) return;
-    setFps(0);
     lastCommittedPreviewRef.current = null;
     setTimeTargetExpanded(false);
     setIsSensorInputOpen(false);
@@ -2023,6 +2055,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   useEffect(() => {
     if (!isOpen || !onPreviewChange) return;
     if (sensorDragActiveRef.current) return;
+    if (sensorAnimationActiveRef.current) return;
     if (suppressPreviewCommitRef.current) return;
     widgetSensorIdRef.current = clampSensorId(widgetSensorId, safeSensorCount);
     commitPreviewSelection(widgetSensorIdRef.current);
@@ -2083,7 +2116,12 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     widgetSensorIdRef.current = nextSensorId;
     setWidgetSensorId(nextSensorId);
     setSensorInputValue(String(nextSensorId));
-    animateSensorWidth(sensorIdToWidth(nextSensorId, safeSensorCount), SENSOR_WIDGET_ANIMATION_MS, nextSensorId);
+    animateSensorWidth(
+      sensorIdToWidth(nextSensorId, safeSensorCount),
+      SENSOR_WIDGET_ANIMATION_MS,
+      nextSensorId,
+      commitPreviewSelection,
+    );
     setIsSensorInputOpen(false);
   };
 
@@ -2103,7 +2141,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     if (!rect) return;
     const nextSensorId = widthToSensorId(event.clientX - rect.left, safeSensorCount);
     const nextWidth = sensorIdToWidth(nextSensorId, safeSensorCount);
-    animateSensorWidth(nextWidth, SENSOR_WIDGET_ANIMATION_MS, nextSensorId);
+    animateSensorWidth(nextWidth, SENSOR_WIDGET_ANIMATION_MS, nextSensorId, commitPreviewSelection);
     event.preventDefault();
   };
 
@@ -2174,7 +2212,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
             // Throttle state update slightly if needed, but for now direct is fine
             setZoomLevel(z);
           },
-          (nextFps: number) => setFps((prev) => (prev === nextFps ? prev : nextFps)),
+          undefined,
         );
       };
       
@@ -2223,7 +2261,6 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       .sort((a, b) => b.percent - a.percent || b.sensorCount - a.sensorCount || a.label.localeCompare(b.label));
   }, [nations, globalLevels, globalScores]);
   const visibleDayCount = getDaysInMonth(widgetMonth);
-  const simTimeLabel = formatSimTimeLabel(currentSimTime);
 
   // Notify parent which nation the selected sensor belongs to
   useEffect(() => {
@@ -2275,23 +2312,6 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
             onContextMenu={handleContextMenu}
           />
 
-          <div className="absolute right-6 top-6 z-[28] pointer-events-none text-right text-white">
-            <div className="text-[11px] font-bold tracking-[0.22em] text-white/55">FPS</div>
-            <div
-              className="text-[28px] font-black leading-none"
-              style={{ fontVariantNumeric: 'tabular-nums' }}
-            >
-              {fps || 0}
-            </div>
-            <div className="mt-3 text-[10px] font-bold tracking-[0.18em] text-white/45">SIM TIME</div>
-            <div
-              className="text-[16px] font-bold leading-tight text-white/88"
-              style={{ fontVariantNumeric: 'tabular-nums' }}
-            >
-              {simTimeLabel}
-            </div>
-          </div>
-
           <SegmentLeaderboardOverlay
             items={segmentLeaderboard}
             zoom={zoomLevel}
@@ -2303,6 +2323,10 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
             zoom={zoomLevel}
             visible={viewMode === 'congestion'}
             onSensorClick={handleNetworkStripSensorClick}
+          />
+
+          <WeatherStatusOverlay
+            condition={weatherCondition}
           />
 
           <div className="absolute right-6 bottom-6 z-[28] pointer-events-auto flex items-center gap-8">
@@ -2519,6 +2543,24 @@ type NetworkStripData = {
   visible: NetworkStripItem[];
 };
 
+const WeatherStatusOverlay: React.FC<{
+  condition?: string;
+}> = ({ condition }) => {
+  const Icon = getWeatherIcon(condition);
+  const accent = getWeatherAccent(condition);
+
+  return (
+    <div className="pointer-events-none absolute bottom-7 left-7 z-[29] text-white">
+      <div
+        className="flex h-[76px] w-[76px] items-center justify-center rounded-full border border-white/12 bg-black/34 backdrop-blur-xl"
+        style={{ boxShadow: `0 0 44px ${accent}33, inset 0 0 22px rgba(255,255,255,0.06)` }}
+      >
+        <Icon size={42} strokeWidth={1.75} style={{ color: accent, filter: `drop-shadow(0 0 12px ${accent}55)` }} />
+      </div>
+    </div>
+  );
+};
+
 function stripWeight(distance: number) {
   if (distance <= 0) return 7.2;
   if (distance <= 1) return 3.2;
@@ -2544,10 +2586,17 @@ const NetworkRelationStripOverlay: React.FC<{
 
   return (
     <motion.aside
-      className="pointer-events-none absolute left-6 top-6 z-[29] text-white"
+      className="absolute left-6 top-6 z-[29] text-white"
       initial={false}
       animate={{ opacity, y: visible ? 0 : -10 }}
       transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+      style={{ pointerEvents: interactive ? 'auto' : 'none' }}
+      onWheel={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+      onPointerDown={(event) => event.stopPropagation()}
+      onTouchMove={(event) => event.stopPropagation()}
       aria-hidden={opacity <= 0.01}
     >
       <div className="flex items-start gap-5">
@@ -2574,7 +2623,7 @@ const NetworkRelationStripOverlay: React.FC<{
                     event.stopPropagation();
                     onSensorClick?.(item.sensorIdx);
                   }}
-                  title={`${item.absoluteIndex + 1} / ${data.total} · #${item.sensorIdx + 1} · ${Math.round((item.score ?? 0) * 100)}%`}
+                  aria-label={`${item.absoluteIndex + 1} / ${data.total}, sensor ${item.sensorIdx + 1}`}
                   style={{
                     flex: weight,
                     marginBottom: item.absoluteIndex === data.end - 1 ? 0 : Math.min(7, 1.5 + weight * 0.75),
@@ -2582,7 +2631,6 @@ const NetworkRelationStripOverlay: React.FC<{
                     border: 0,
                     background: 'transparent',
                     cursor: 'pointer',
-                    pointerEvents: interactive ? 'auto' : 'none',
                   }}
                 >
                   <div

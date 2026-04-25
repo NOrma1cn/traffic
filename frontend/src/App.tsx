@@ -12,17 +12,15 @@ import {
   Droplets,
   Eye,
   Percent,
-  AlertTriangle,
-  X,
 } from 'lucide-react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { motion } from 'framer-motion';
 import ForecastChart from './components/ForecastChart';
 import BackgroundShader, { type SunnyDayPhase } from './components/BackgroundShader';
 import LogoShader from './components/LogoShader';
 import { NetworkSphereModal, type PanoramaMode } from './components/NetworkSphereModal';
 import RiskDashboardHUD from './components/RiskDashboardHUD';
 import HUDContainer from './components/HUDContainer';
-import IncidentStatusPanel, { type IncidentContext, type IncidentEvent, type IncidentScenario } from './components/IncidentStatusPanel';
+import { type IncidentContext, type IncidentScenario } from './components/IncidentStatusPanel';
 import WeatherTopologyRing, { type WeatherRingMetric } from './components/WeatherTopologyRing';
 import { deriveWeatherVisual } from './weather';
 import { useDesignViewport } from './hooks/useDesignViewport';
@@ -30,8 +28,6 @@ import { useDesignViewport } from './hooks/useDesignViewport';
 const DEFAULT_POLL_MS = import.meta.env.DEV ? 3_000 : 300_000;
 const POLL_MS = Number(import.meta.env.VITE_POLL_MS ?? DEFAULT_POLL_MS);
 const ENV_API_BASE = String(import.meta.env.VITE_API_BASE ?? '').replace(/\/+$/, '');
-const LOGO_W = 180;
-const LOGO_H = 44;
 const DESIRED_MODE = 'multitask_occ_primary_weather_attn';
 const DESIGN_WIDTH = 2560;
 const DESIGN_HEIGHT = 1600;
@@ -46,32 +42,6 @@ const KMH_PER_MPH = 1.60934;
 const MM_PER_INCH = 25.4;
 const DAY_START_SLOT = 0;
 const DAYS_IN_MONTH_2023 = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-const DEBUG_FAKE_INCIDENT_START_MINUTES = 8;
-const DEBUG_FAKE_INCIDENT_DURATION_MINUTES = 22;
-const DEBUG_STRESS_MIN_DURATION_MINUTES = 4;
-const DEBUG_STRESS_MAX_DURATION_MINUTES = 11;
-
-const DEBUG_STRESS_INCIDENT_CATALOG: Array<{ category: IncidentEvent['category']; subtype_id: number; label: string }> = [
-  { category: 'collision', subtype_id: 1, label: 'Multi-Car Shockwave' },
-  { category: 'collision', subtype_id: 23, label: 'Ramp Merge Impact' },
-  { category: 'obstruction_hazard', subtype_id: 0, label: 'Debris Scatter' },
-  { category: 'obstruction_hazard', subtype_id: 12, label: 'Spinout Recovery' },
-  { category: 'fire_hazmat', subtype_id: 9, label: 'Shoulder Engine Fire' },
-  { category: 'control_closure', subtype_id: 11, label: 'Rolling Traffic Break' },
-  { category: 'maintenance_construction', subtype_id: 10, label: 'Night Work Merge' },
-  { category: 'weather_environment', subtype_id: 30, label: 'Fog Pocket' },
-  { category: 'emergency_special', subtype_id: 13, label: 'Wrong-Way Alert' },
-];
-
-const DEBUG_STRESS_LOCATION_PARTS = ['主线', '匝道口', '并道段', '出口前', '高架下方', '桥面', '收费站后', '中央分隔带'];
-
-type DebugIncidentWindow = {
-  startTime: string;
-  endTime: string;
-};
-
-const randomInt = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min;
-const randomPick = <T,>(items: T[]) => items[randomInt(0, items.length - 1)];
 
 const clampMonth = (month: number) => Math.max(1, Math.min(12, Math.floor(month)));
 const clampDay = (month: number, day: number) => {
@@ -234,22 +204,6 @@ type ApiResponse = {
     speed_kmh: number[];
     risk_score: number[];
     congestion_probability: number[];
-  };
-  weekly_compare?: {
-    points: number;
-    tail_len: number;
-    stride: number;
-    times: string[];
-    days: Array<{
-      day: string;
-      date: string;
-      is_today: boolean;
-      flow_veh_5min: number[];
-      occupancy_pct: number[];
-      speed_kmh: number[];
-      risk_score: number[];
-      congestion_probability: number[];
-    }>;
   };
   confidence: {
     score: number;
@@ -447,11 +401,6 @@ const App: React.FC = () => {
   const [sphereDateSelection, setSphereDateSelection] = useState<{ month: number; day: number } | null>(null);
   const [selectedTObsOverride, setSelectedTObsOverride] = useState<number | null>(null);
   const [backgroundLedMode, setBackgroundLedMode] = useState(false);
-  const [incidentPanelOpen, setIncidentPanelOpen] = useState(false);
-  const [debugFutureIncidentEnabled, setDebugFutureIncidentEnabled] = useState(false);
-  const [debugFutureIncidentWindow, setDebugFutureIncidentWindow] = useState<DebugIncidentWindow | null>(null);
-  const [debugStressIncidents, setDebugStressIncidents] = useState<IncidentEvent[]>([]);
-  const [backgroundFps, setBackgroundFps] = useState(0);
   const designViewport = useDesignViewport(viewport.w, viewport.h, DESIGN_WIDTH, DESIGN_HEIGHT);
 
   const abortRef = useRef<AbortController | null>(null);
@@ -460,6 +409,25 @@ const App: React.FC = () => {
   const loadingRef = useRef<boolean>(false);
   const mainRequestKeyRef = useRef<string | null>(null);
   const spherePreviewRequestKeyRef = useRef<string | null>(null);
+  const selectedTObsOverrideRef = useRef<number | null>(null);
+  const datasetTimeStepCount = Math.max(1, Math.floor(api?.dataset_context?.time_steps ?? 1));
+
+  const setManualTObsOverride = (value: number | null) => {
+    const next = Number.isFinite(value)
+      ? ((Math.floor(Number(value)) % datasetTimeStepCount) + datasetTimeStepCount) % datasetTimeStepCount
+      : null;
+    selectedTObsOverrideRef.current = next;
+    setSelectedTObsOverride(next);
+  };
+
+  const advanceManualTObsOverride = () => {
+    const current = selectedTObsOverrideRef.current;
+    if (current === null) return undefined;
+    const next = (Math.floor(current) + 1) % datasetTimeStepCount;
+    selectedTObsOverrideRef.current = next;
+    return next;
+  };
+
   const toBackendWeatherOverride = (ui: {
     temp_c: number;
     humidity: number;
@@ -664,7 +632,7 @@ const App: React.FC = () => {
   useEffect(() => {
     if (bootPhase !== 'ready' || isSphereOpen) return;
     fetchForecastOnce(sensor, undefined, {
-      tObs: selectedTObsOverride ?? undefined,
+      tObs: selectedTObsOverrideRef.current ?? undefined,
     }).catch(() => {});
   }, [sensor, bootPhase, apiBase, isSphereOpen, selectedTObsOverride]);
 
@@ -675,9 +643,10 @@ const App: React.FC = () => {
       while (!cancelled) {
         await sleep(Number.isFinite(POLL_MS) ? POLL_MS : 3000);
         if (cancelled) return;
+        const nextManualTObs = advanceManualTObsOverride();
         await fetchForecastOnce(undefined, undefined, {
           abortPrev: false,
-          tObs: selectedTObsOverride ?? undefined,
+          tObs: nextManualTObs,
         }).catch(() => {});
       }
     };
@@ -787,8 +756,9 @@ const App: React.FC = () => {
   const uiVisible = bootPhase === 'ready';
   const isBackgroundActive = !isSphereOpen;
   const dashboardChromeVisible = uiVisible && !isSphereOpen;
-  const logoMode = bootPhase === 'checking' || bootPhase === 'error' ? 'center' : 'corner';
   const weatherVisual = deriveWeatherVisual(api?.current_weather);
+  const sphereWeather = (isSphereOpen ? spherePreviewApi?.current_weather : undefined) ?? api?.current_weather;
+  const sphereWeatherVisual = deriveWeatherVisual(sphereWeather);
   const congestionWarningLevel = api?.congestion_summary?.peak_level === 'severe' || api?.congestion_summary?.peak_level === 'high' ? 'high' : api?.congestion_summary?.peak_level === 'medium' ? 'medium' : 'low';
   const dayPhase = useMemo<SunnyDayPhase>(() => {
     if (!api?.meta?.sim_time) return 'noon';
@@ -815,7 +785,6 @@ const App: React.FC = () => {
       let predicted: number[] = [];
       let branchPredicted: number[] | undefined;
       let referenceValue: number | undefined;
-      let referenceLabel: string | undefined;
       let metricLabel = '';
       let unit = '';
 
@@ -824,7 +793,6 @@ const App: React.FC = () => {
         predicted = api.prediction_series.speed_kmh;
         branchPredicted = customApi?.prediction_series?.speed_kmh;
         referenceValue = api.current.baseline_speed_kmh;
-        referenceLabel = '历史统计均值';
         metricLabel = '速度监控';
         unit = 'km/h';
       } else if (m === 'occupancy') {
@@ -832,7 +800,6 @@ const App: React.FC = () => {
         predicted = api.prediction_series.occupancy_pct;
         branchPredicted = customApi?.prediction_series?.occupancy_pct;
         referenceValue = api.current.baseline_occupancy_pct;
-        referenceLabel = '历史统计均值';
         metricLabel = '路段占有率';
         unit = '%';
       } else if (m === 'flow') {
@@ -840,7 +807,6 @@ const App: React.FC = () => {
         predicted = api.prediction_series.flow_veh_5min;
         branchPredicted = customApi?.prediction_series?.flow_veh_5min;
         referenceValue = api.current.baseline_flow_veh_5min;
-        referenceLabel = '历史统计均值';
         metricLabel = '实时流量';
         unit = 'veh/5m';
       } else {
@@ -848,7 +814,6 @@ const App: React.FC = () => {
         predicted = api.prediction_series.risk_score.map((v) => v * 100);
         branchPredicted = customApi?.prediction_series?.risk_score?.map((v) => v * 100);
         referenceValue = 60;
-        referenceLabel = '高拥堵程度';
         metricLabel = '拥堵程度';
         unit = '%';
       }
@@ -857,14 +822,6 @@ const App: React.FC = () => {
       const historyData = historyTimes.map((time, idx) => ({ time, observed: observed[idx] ?? null, predicted: idx === historyTimes.length - 1 ? lastObserved : null }));
       const predData = predTimes.map((time, idx) => ({ time, observed: null, predicted: predicted[idx] ?? null }));
       const data = [...historyData, ...predData];
-      const multiDayData = api.weekly_compare?.days?.map((d) => {
-        let series: number[] = [];
-        if (m === 'speed') series = d.speed_kmh;
-        else if (m === 'occupancy') series = d.occupancy_pct;
-        else if (m === 'flow') series = d.flow_veh_5min;
-        else series = d.risk_score.map((v) => v * 100);
-        return { day: d.day, date: d.date, data: Array.isArray(series) ? series : [], isToday: Boolean(d.is_today) };
-      });
 
       // Unified Dynamic Limit Calculation (Sync with ForecastChart logic)
       const allY = [...observed, ...predicted, ...(branchPredicted ?? [])];
@@ -875,11 +832,8 @@ const App: React.FC = () => {
       configs[m] = {
         data,
         referenceValue,
-        referenceLabel,
         metricLabel,
         unit,
-        multiDayData,
-        weeklyTimes: api.weekly_compare?.times,
         limit,
         branchPredicted: weatherOverrideEnabled ? branchPredicted : undefined,
       };
@@ -889,134 +843,6 @@ const App: React.FC = () => {
 
   const predictionStartIdx = api ? Math.max(api.history_tail.times.length - 1, 0) : 0;
   const activeChart = chartConfigs[selectedMetric];
-  const debugStressModeEnabled = debugStressIncidents.length > 0;
-
-  const buildDebugStressIncidents = () => {
-    if (!api || !activeChart?.data?.length) return [] as IncidentEvent[];
-
-    const baseTime = new Date(api.meta.sim_time);
-    if (Number.isNaN(baseTime.getTime())) return [];
-
-    const stepMinutes = Math.max(1, Math.round((api.meta.tick_seconds || 300) / 60));
-    const firstMs = baseTime.getTime() - predictionStartIdx * stepMinutes * 60000;
-    const lastMs = firstMs + Math.max(0, activeChart.data.length - 1) * stepMinutes * 60000;
-    const totalMinutes = Math.max(1, Math.round((lastMs - firstMs) / 60000));
-    const incidents: IncidentEvent[] = [];
-
-    let cursor = firstMs + randomInt(0, Math.max(1, stepMinutes * 2)) * 60000;
-    while (cursor < lastMs - DEBUG_STRESS_MIN_DURATION_MINUTES * 60000 && incidents.length < 24) {
-      const durationMinutes = randomInt(DEBUG_STRESS_MIN_DURATION_MINUTES, DEBUG_STRESS_MAX_DURATION_MINUTES);
-      const endMs = cursor + durationMinutes * 60000;
-      if (endMs > lastMs) break;
-
-      const spec = randomPick(DEBUG_STRESS_INCIDENT_CATALOG);
-      const distanceKm = randomInt(2, 26) / 10;
-      const locationText = `${randomPick(DEBUG_STRESS_LOCATION_PARTS)} ${randomInt(1, 9)}号位`;
-
-      incidents.push({
-        incident_id: 991000 + incidents.length,
-        event_type: `${spec.label} ${randomInt(100, 999)}`,
-        subtype_id: spec.subtype_id,
-        category: spec.category,
-        severity: Number((0.65 + Math.random() * 0.95).toFixed(2)),
-        duration_minutes: durationMinutes,
-        minutes_since_start: 0,
-        minutes_until_clear: durationMinutes,
-        freeway: api.station.freeway,
-        direction: api.station.direction,
-        location_text: locationText,
-        distance_km: distanceKm,
-        spatial_weight: Number((0.45 + Math.random() * 0.5).toFixed(2)),
-        phase: 'active',
-        debug_start_time: new Date(cursor).toISOString(),
-        debug_end_time: new Date(endMs).toISOString(),
-      });
-
-      cursor = endMs + randomInt(1, 3) * 60000;
-    }
-
-    const minTarget = Math.max(6, Math.min(10, Math.floor(totalMinutes / 12)));
-    return incidents.length >= minTarget ? incidents : incidents.slice(0, Math.max(1, incidents.length));
-  };
-
-  const toggleDebugFutureIncident = () => {
-    if (debugFutureIncidentEnabled) {
-      setDebugFutureIncidentEnabled(false);
-      setDebugFutureIncidentWindow(null);
-      return;
-    }
-
-    const baseTime = api?.meta?.sim_time ? new Date(api.meta.sim_time) : null;
-    if (!baseTime || Number.isNaN(baseTime.getTime())) return;
-
-    const startTime = new Date(baseTime.getTime() + DEBUG_FAKE_INCIDENT_START_MINUTES * 60000);
-    const endTime = new Date(startTime.getTime() + DEBUG_FAKE_INCIDENT_DURATION_MINUTES * 60000);
-
-    setDebugFutureIncidentWindow({
-      startTime: startTime.toISOString(),
-      endTime: endTime.toISOString(),
-    });
-    setDebugStressIncidents([]);
-    setDebugFutureIncidentEnabled(true);
-  };
-
-  const toggleDebugStressIncidents = () => {
-    if (debugStressModeEnabled) {
-      setDebugStressIncidents([]);
-      return;
-    }
-
-    const incidents = buildDebugStressIncidents();
-    if (!incidents.length) return;
-    setDebugFutureIncidentEnabled(false);
-    setDebugFutureIncidentWindow(null);
-    setDebugStressIncidents(incidents);
-  };
-
-  const debugFutureIncident = useMemo<IncidentEvent | null>(() => {
-    if (!api || !debugFutureIncidentWindow) return null;
-
-    return {
-      incident_id: 990001,
-      event_type: 'Frontend Debug: Near-Future Collision',
-      subtype_id: 1,
-      category: 'collision',
-      severity: 1.15,
-      duration_minutes: DEBUG_FAKE_INCIDENT_DURATION_MINUTES,
-      minutes_since_start: 0,
-      minutes_until_clear: DEBUG_FAKE_INCIDENT_DURATION_MINUTES,
-      freeway: api.station.freeway,
-      direction: api.station.direction,
-      location_text: `${api.station.id} 前方 0.6 km`,
-      distance_km: 0.6,
-      spatial_weight: 0.88,
-      phase: 'active',
-      debug_start_in_minutes: DEBUG_FAKE_INCIDENT_START_MINUTES,
-      debug_start_time: debugFutureIncidentWindow.startTime,
-      debug_end_time: debugFutureIncidentWindow.endTime,
-    };
-  }, [api, debugFutureIncidentWindow]);
-
-  const chartAccidents = useMemo<IncidentContext | null>(() => {
-    const useStressOnly = debugStressModeEnabled && debugStressIncidents.length > 0;
-    if (!api?.accidents && !useStressOnly && !(debugFutureIncidentEnabled && debugFutureIncident)) return api?.accidents ?? null;
-
-    const currentEvents = useStressOnly ? [...debugStressIncidents] : [...(api?.accidents?.current_events ?? [])];
-    if (!useStressOnly && debugFutureIncidentEnabled && debugFutureIncident) {
-      currentEvents.unshift(debugFutureIncident);
-    }
-
-    return {
-      ...(api?.accidents ?? {}),
-      current_events: currentEvents,
-      summary: {
-        ...(api?.accidents?.summary ?? {}),
-        has_active_incident: Boolean((api?.accidents?.summary?.has_active_incident ?? false) || currentEvents.length > 0),
-        current_event_count: currentEvents.length,
-        active_event_count: Math.max(api?.accidents?.summary?.active_event_count ?? 0, currentEvents.length),
-      },
-    };
-  }, [api?.accidents, debugFutureIncidentEnabled, debugFutureIncident, debugStressModeEnabled, debugStressIncidents]);
 
   const weatherRingData = useMemo(() => {
     if (!api?.current_weather) return null;
@@ -1120,6 +946,11 @@ const App: React.FC = () => {
     />
   ) : null;
 
+  const openNetworkSphere = () => {
+    setPanoramaMode('congestion');
+    setIsSphereOpen(true);
+  };
+
   return (
     <div
       className="min-h-screen bg-transparent text-white flex overflow-hidden relative"
@@ -1136,27 +967,7 @@ const App: React.FC = () => {
         dayPhase={dayPhase}
         ledMode={backgroundLedMode}
         isActive={isBackgroundActive}
-        onFpsUpdate={(nextFps) => setBackgroundFps((prev) => (prev === nextFps ? prev : nextFps))}
       />
-
-      {uiVisible && (
-        <motion.div
-          className="fixed right-6 top-6 z-[32] pointer-events-none text-right text-white"
-          animate={{ opacity: dashboardChromeVisible ? 1 : 0, y: dashboardChromeVisible ? 0 : -10 }}
-          transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
-        >
-          <div className="text-[11px] font-bold tracking-[0.22em] text-white/55">BG FPS</div>
-          <div
-            className="text-[28px] font-black leading-none"
-            style={{ fontVariantNumeric: 'tabular-nums' }}
-          >
-            {backgroundFps}
-          </div>
-          <div className="text-[10px] font-mono text-white/35">
-            {isBackgroundActive ? 'ACTIVE' : 'PAUSED'}
-          </div>
-        </motion.div>
-      )}
 
       {/* Curved diagonal mask: left-bottom darkest in normal, right-bottom darkest in LED */}
       <div className="fixed inset-0 pointer-events-none z-[5]" style={{ display: isBackgroundActive ? 'block' : 'none' }}>
@@ -1176,57 +987,12 @@ const App: React.FC = () => {
             opacity: backgroundLedMode ? 1 : 0,
             transition: 'opacity 1.2s cubic-bezier(0.4, 0, 0.2, 1)',
             willChange: 'opacity',
+            transform: 'scaleX(-1)',
             background:
-              'radial-gradient(ellipse 100% 100% at 0% 0%, transparent 34%, rgba(8, 8, 12, 0.68) 78%, #030305 100%)',
+              'radial-gradient(ellipse 100% 100% at 100% 0%, transparent 34%, rgba(8, 8, 12, 0.68) 78%, #030305 100%)',
           }}
         />
       </div>
-
-      <motion.div
-        className="fixed left-0 top-0 z-[11] overflow-hidden pointer-events-none"
-        style={designViewport.frameStyle}
-        animate={{ opacity: dashboardChromeVisible ? 1 : 0, y: dashboardChromeVisible ? 0 : 12 }}
-        transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
-      >
-        <motion.div
-          className="fixed z-[100] flex items-center gap-3 select-none pointer-events-auto"
-          variants={{
-            center: { top: DESIGN_HEIGHT / 2, left: DESIGN_WIDTH / 2, x: -32, y: -LOGO_H / 2 - 100, scale: 1.2, opacity: 1 },
-            corner: { top: 32, left: 32, x: 0, y: 0, scale: 1.0, opacity: 1 },
-          }}
-          initial="center"
-          animate={logoMode}
-          transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
-          onAnimationComplete={() => { if (bootPhase === 'transition') setBootPhase('ready'); }}
-        >
-          {logoMode === 'center' ? (
-            <LogoShader size={64} />
-          ) : (
-            <div 
-              className="flex flex-col cursor-pointer transition-all duration-300 hover:opacity-70 active:scale-95 group"
-              onClick={() => {
-                if (bootPhase === 'ready' && logoMode === 'corner') {
-                  setPanoramaMode('congestion');
-                  setIsSphereOpen(true);
-                }
-              }}
-            >
-              <div className="text-xl font-technical font-black text-white tracking-[0.2em] leading-tight group-hover:text-cyan-400 transition-colors">
-                WEATHER NET
-              </div>
-              <div className="flex items-center gap-2 mt-1">
-                <div className="text-[8px] font-technical font-bold text-cyan-400 tracking-widest opacity-80">
-                  DISTRICT 03 / SACRAMENTO
-                </div>
-                <div className="w-12 h-[1px] bg-white/10 group-hover:bg-cyan-400/50 transition-colors" />
-              </div>
-            </div>
-          )}
-        </motion.div>
-      </motion.div>
-
-
-
 
       {bootPhase !== 'ready' && (
         <motion.div
@@ -1259,7 +1025,7 @@ const App: React.FC = () => {
       <NetworkSphereModal
         isOpen={isSphereOpen} onClose={() => { setIsSphereOpen(false); setSpherePreview(null); setSpherePreviewApi(null); }}
         onSelectSensor={(idx, timeIndex) => {
-          setSelectedTObsOverride(Number.isFinite(timeIndex) ? Math.floor(timeIndex) : null);
+          setManualTObsOverride(Number.isFinite(timeIndex) ? Math.floor(timeIndex) : null);
           setSensor(idx);
           setIsSphereOpen(false);
           setSpherePreview(null);
@@ -1280,6 +1046,10 @@ const App: React.FC = () => {
         previewTimeIndex={spherePreview?.tObs ?? null}
         selectedMonth={sphereDateSelection?.month}
         selectedDay={sphereDateSelection?.day}
+        weatherCondition={sphereWeatherVisual.displayCondition}
+        weatherLabel={sphereWeatherVisual.label}
+        weatherTempC={sphereWeather?.temp_c}
+        weatherPrecipitationPct={sphereWeather?.precipitation_pct}
         onDateChange={(month, day) => {
           setSphereDateSelection((prev) => {
             const next = { month: clampMonth(month), day: clampDay(month, day) };
@@ -1309,112 +1079,28 @@ const App: React.FC = () => {
           <main className="flex-1 min-w-0 flex flex-col h-full relative z-10 pt-28 overflow-hidden pointer-events-none">
           {api && (
             <>
-              <div className="fixed left-8 top-32 z-40 flex items-center gap-3 pointer-events-auto">
-                <button
-                  type="button"
-                  onClick={() => setIncidentPanelOpen(true)}
-                  className="inline-flex h-11 items-center gap-2 rounded-full border border-rose-300/20 bg-black/45 px-4 text-xs font-black uppercase tracking-[0.18em] text-rose-100 shadow-[0_12px_40px_rgba(0,0,0,0.35)] backdrop-blur-xl transition hover:border-rose-300/45 hover:bg-rose-500/15 active:scale-95"
-                  aria-label="打开事故调试页"
-                >
-                  <AlertTriangle size={16} className={api.accidents?.summary?.has_active_incident ? 'text-rose-300' : 'text-white/45'} />
-                  事故调试
-                  <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5 font-mono text-[10px] text-white/70">
-                    {api.accidents?.summary?.current_event_count ?? api.accidents?.summary?.active_feature_count ?? 0}
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={toggleDebugFutureIncident}
-                  className={`inline-flex h-11 items-center gap-2 rounded-full border px-4 text-[11px] font-black uppercase tracking-[0.18em] shadow-[0_12px_40px_rgba(0,0,0,0.35)] backdrop-blur-xl transition active:scale-95 ${
-                    debugFutureIncidentEnabled
-                      ? 'border-cyan-300/40 bg-cyan-400/18 text-cyan-100 hover:border-cyan-200/60 hover:bg-cyan-400/24'
-                      : 'border-white/10 bg-black/45 text-white/72 hover:border-white/25 hover:bg-white/8'
-                  }`}
-                  aria-label="切换前端模拟事故"
-                  title="仅前端：在未来很近的时间注入一条假事故，便于调试曲线图 overlay"
-                >
-                  <AlertTriangle size={16} className={debugFutureIncidentEnabled ? 'text-cyan-200' : 'text-white/45'} />
-                  模拟事故
-                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] ${debugFutureIncidentEnabled ? 'border-cyan-200/30 bg-cyan-300/15 text-cyan-100' : 'border-white/10 bg-white/10 text-white/60'}`}>
-                    {debugFutureIncidentEnabled ? new Date(debugFutureIncidentWindow?.startTime ?? '').toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }) : 'OFF'}
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={toggleDebugStressIncidents}
-                  className={`inline-flex h-11 items-center gap-2 rounded-full border px-4 text-[11px] font-black uppercase tracking-[0.18em] shadow-[0_12px_40px_rgba(0,0,0,0.35)] backdrop-blur-xl transition active:scale-95 ${
-                    debugStressModeEnabled
-                      ? 'border-fuchsia-300/40 bg-fuchsia-400/18 text-fuchsia-100 hover:border-fuchsia-200/60 hover:bg-fuchsia-400/24'
-                      : 'border-white/10 bg-black/45 text-white/72 hover:border-white/25 hover:bg-white/8'
-                  }`}
-                  aria-label="切换事故压测模式"
-                  title="仅前端：生成高频、随机、互不重叠的事故窗口，用来压测曲线图 overlay"
-                >
-                  <AlertTriangle size={16} className={debugStressModeEnabled ? 'text-fuchsia-200' : 'text-white/45'} />
-                  事故压测
-                  <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] ${debugStressModeEnabled ? 'border-fuchsia-200/30 bg-fuchsia-300/15 text-fuchsia-100' : 'border-white/10 bg-white/10 text-white/60'}`}>
-                    {debugStressModeEnabled ? `${debugStressIncidents.length}X` : 'OFF'}
-                  </span>
-                </button>
-              </div>
-
-              <AnimatePresence>
-                {incidentPanelOpen && (
-                  <motion.div
-                    className="fixed inset-0 z-[80] flex items-start justify-center bg-black/60 px-10 py-10 backdrop-blur-sm pointer-events-auto"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    transition={{ duration: 0.18 }}
-                    onMouseDown={() => setIncidentPanelOpen(false)}
-                  >
-                    <motion.div
-                      className="relative w-[min(1900px,calc(100vw-80px))] max-h-[calc(100vh-80px)] overflow-y-auto"
-                      initial={{ opacity: 0, y: 16, scale: 0.98 }}
-                      animate={{ opacity: 1, y: 0, scale: 1 }}
-                      exit={{ opacity: 0, y: 12, scale: 0.98 }}
-                      transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-                      onMouseDown={(event) => event.stopPropagation()}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => setIncidentPanelOpen(false)}
-                        className="absolute right-4 top-4 z-10 flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-black/40 text-white/60 transition hover:border-white/25 hover:text-white"
-                        aria-label="关闭事故调试页"
-                      >
-                        <X size={18} />
-                      </button>
-                      <IncidentStatusPanel accidents={api.accidents} incidentScenarios={api.incident_scenarios ?? []} />
-                    </motion.div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-
               {/* INTEGRATED BOTTOM ANALYTICS UNIT (CHART + HUD) */}
               <div className="fixed bottom-10 left-8 right-8 z-30 h-[680px] pointer-events-auto">
                 <div className="relative h-full w-full">
                   
                   {/* Left: Trend Analysis (Flexible) */}
-                  <div className="absolute left-0 bottom-0 right-[980px] pr-6">
-                    {activeChart && (
-                      <ForecastChart
-                        data={activeChart.data}
-                        predictionStartIdx={predictionStartIdx}
-                        metricLabel={activeChart.metricLabel}
-                        unit={activeChart.unit}
-                        referenceValue={activeChart.referenceValue}
-                        referenceLabel={activeChart.referenceLabel}
-                        multiDayData={activeChart.multiDayData}
-                        weeklyTimes={activeChart.weeklyTimes}
-                        simTime={api.meta.sim_time}
-                        forcedMax={activeChart.limit}
-                        branchPredicted={activeChart.branchPredicted}
-                        branchLabel={weatherOverrideEnabled ? `${WEATHER_PRESETS.find((preset) => preset.key === weatherPreset)?.label ?? '天气'}模拟分支` : undefined}
-                        accidents={chartAccidents}
-                      />
-                    )}
+                  <div className="absolute left-0 top-6 bottom-0 right-[980px] pr-6">
+                    <div className="h-full">
+                      {activeChart && (
+                        <ForecastChart
+                          data={activeChart.data}
+                          predictionStartIdx={predictionStartIdx}
+                          metricLabel={activeChart.metricLabel}
+                          unit={activeChart.unit}
+                          simTime={api.meta.sim_time}
+                          forcedMax={activeChart.limit}
+                          branchPredicted={activeChart.branchPredicted}
+                          branchLabel={weatherOverrideEnabled ? `${WEATHER_PRESETS.find((preset) => preset.key === weatherPreset)?.label ?? '天气'}模拟分支` : undefined}
+                          accidents={api.accidents ?? null}
+                          onOpenNetworkSphere={openNetworkSphere}
+                        />
+                      )}
+                    </div>
                   </div>
 
                   {/* Right: Real-time Telemetry (HUD BAY) */}
