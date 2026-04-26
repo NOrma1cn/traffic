@@ -24,6 +24,7 @@ import { type IncidentContext, type IncidentScenario } from './components/Incide
 import WeatherTopologyRing, { type WeatherRingMetric } from './components/WeatherTopologyRing';
 import { deriveWeatherVisual } from './weather';
 import { useDesignViewport } from './hooks/useDesignViewport';
+import V2BlankPage from './pages/V2BlankPage';
 
 const DEFAULT_POLL_MS = import.meta.env.DEV ? 3_000 : 300_000;
 const POLL_MS = Number(import.meta.env.VITE_POLL_MS ?? DEFAULT_POLL_MS);
@@ -33,7 +34,7 @@ const DESIGN_WIDTH = 2560;
 const DESIGN_HEIGHT = 1600;
 const LED_WEATHER_RING_CENTER_X = '58%';
 const LED_WEATHER_RING_CENTER_Y = '50%';
-const LED_WEATHER_RING_SCALE = 2.07;
+const LED_WEATHER_RING_SCALE = 2.28;
 
 const normalizeBase = (base: string) => String(base ?? '').replace(/\/+$/, '');
 const apiUrlWithBase = (base: string, path: string) => `${normalizeBase(base)}${path.startsWith('/') ? path : `/${path}`}`;
@@ -66,6 +67,25 @@ const monthDayToTObs = (month: number, day: number, slot: number, maxTimeIndex: 
   const dayBefore = DAYS_IN_MONTH_2023.slice(0, m - 1).reduce((acc, v) => acc + v, 0);
   const idx = dayBefore * 288 + (d - 1) * 288 + Math.max(0, Math.min(287, Math.floor(slot)));
   return Math.max(0, Math.min(Math.max(0, maxTimeIndex), idx));
+};
+
+const tObsSlot = (tObs: number): number => {
+  const slot = Math.floor(Number.isFinite(tObs) ? tObs : 0) % 288;
+  return Math.max(0, Math.min(287, slot < 0 ? slot + 288 : slot));
+};
+
+const monthDayToPreviewTObs = (
+  month: number,
+  day: number,
+  currentTObs: number,
+  maxTimeIndex: number,
+): number => {
+  const target = { month: clampMonth(month), day: clampDay(month, day) };
+  const current = tObsToMonthDay(currentTObs);
+  const slot = current.month === target.month && current.day === target.day
+    ? tObsSlot(currentTObs)
+    : DAY_START_SLOT;
+  return monthDayToTObs(target.month, target.day, slot, maxTimeIndex);
 };
 
 type WeatherPresetKey = 'clear' | 'cloudy' | 'rain' | 'storm' | 'fog';
@@ -204,6 +224,13 @@ type ApiResponse = {
     speed_kmh: number[];
     risk_score: number[];
     congestion_probability: number[];
+  };
+  daily_congestion?: {
+    times: string[];
+    risk_score: Array<number | null>;
+    risk_level: Array<'low' | 'medium' | 'high' | 'severe' | 'none'>;
+    current_hour: number;
+    hour_count: number;
   };
   confidence: {
     score: number;
@@ -375,7 +402,16 @@ const levelLabel = (level: string) => {
   }
 };
 
-const App: React.FC = () => {
+type AppView = 'v1' | 'v2';
+
+const V2_HASH = '#/v2';
+
+const getAppView = (): AppView => {
+  if (typeof window === 'undefined') return 'v1';
+  return window.location.hash === V2_HASH ? 'v2' : 'v1';
+};
+
+const DashboardV1Page: React.FC = () => {
   const [sensor, setSensor] = useState<number>(42);
   const [nSensors, setNSensors] = useState<number>(743);
   const [apiBase, setApiBase] = useState<string>(ENV_API_BASE);
@@ -390,6 +426,9 @@ const App: React.FC = () => {
     h: typeof window === 'undefined' ? 768 : window.innerHeight,
   }));
   const [isSphereOpen, setIsSphereOpen] = useState<boolean>(false);
+  const [sphereExpandedUi, setSphereExpandedUi] = useState<boolean>(false);
+  const [sphereTransitioning, setSphereTransitioning] = useState<boolean>(false);
+  const [sphereFocusRequestKey, setSphereFocusRequestKey] = useState<number>(0);
   const [panoramaMode, setPanoramaMode] = useState<PanoramaMode>('congestion');
   const [graphData, setGraphData] = useState<{ nodes: any[]; links: any[] } | null>(null);
   const [selectedMetric, setSelectedMetric] = useState<MetricKey>('risk');
@@ -682,7 +721,7 @@ const App: React.FC = () => {
     if (!isSphereOpen || !api) return;
     const initialDate = sphereDateSelection ?? tObsToMonthDay(api.meta.t_obs);
     const maxTimeIndex = (api.dataset_context?.time_steps ?? 1) - 1;
-    const tObs = monthDayToTObs(initialDate.month, initialDate.day, DAY_START_SLOT, maxTimeIndex);
+    const tObs = monthDayToPreviewTObs(initialDate.month, initialDate.day, api.meta.t_obs, maxTimeIndex);
     setSphereDateSelection(initialDate);
     setSpherePreview((prev) => prev ?? { sensor, tObs });
   }, [isSphereOpen, api, sensor]);
@@ -690,7 +729,12 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!isSphereOpen || !api || !sphereDateSelection) return;
     const maxTimeIndex = (api.dataset_context?.time_steps ?? 1) - 1;
-    const tObs = monthDayToTObs(sphereDateSelection.month, sphereDateSelection.day, DAY_START_SLOT, maxTimeIndex);
+    const tObs = monthDayToPreviewTObs(
+      sphereDateSelection.month,
+      sphereDateSelection.day,
+      api.meta.t_obs,
+      maxTimeIndex,
+    );
     setSpherePreview((prev) => {
       const nextSensor = prev?.sensor ?? sensor;
       if (prev && prev.sensor === nextSensor && prev.tObs === tObs) return prev;
@@ -755,7 +799,7 @@ const App: React.FC = () => {
 
   const uiVisible = bootPhase === 'ready';
   const isBackgroundActive = !isSphereOpen;
-  const dashboardChromeVisible = uiVisible && !isSphereOpen;
+  const dashboardChromeVisible = uiVisible && !isSphereOpen && !sphereTransitioning;
   const weatherVisual = deriveWeatherVisual(api?.current_weather);
   const sphereWeather = (isSphereOpen ? spherePreviewApi?.current_weather : undefined) ?? api?.current_weather;
   const sphereWeatherVisual = deriveWeatherVisual(sphereWeather);
@@ -948,8 +992,28 @@ const App: React.FC = () => {
 
   const openNetworkSphere = () => {
     setPanoramaMode('congestion');
+    setSphereExpandedUi(false);
+    setSphereTransitioning(true);
     setIsSphereOpen(true);
   };
+  const closeNetworkSphere = () => {
+    setSphereFocusRequestKey((value) => value + 1);
+    setSphereExpandedUi(false);
+    setSphereTransitioning(true);
+    setIsSphereOpen(false);
+  };
+  const networkOrbScale = 0.16;
+  const networkOrbTargetX = 160;
+  const networkOrbTargetY = 160;
+  const networkOrbScreenX = designViewport.offsetX + networkOrbTargetX * designViewport.scale;
+  const networkOrbScreenY = designViewport.offsetY + networkOrbTargetY * designViewport.scale;
+  const networkSphereEntryTransition = {
+    x: networkOrbScreenX - viewport.w / 2,
+    y: networkOrbScreenY - viewport.h / 2,
+    scale: Math.max(0.04, networkOrbScale * designViewport.scale),
+  };
+  const sphereCompactOrb = !sphereExpandedUi;
+  const sphereRenderFps = !isSphereOpen && !sphereTransitioning ? 1 : sphereExpandedUi ? undefined : 30;
 
   return (
     <div
@@ -970,7 +1034,7 @@ const App: React.FC = () => {
       />
 
       {/* Curved diagonal mask: left-bottom darkest in normal, right-bottom darkest in LED */}
-      <div className="fixed inset-0 pointer-events-none z-[5]" style={{ display: isBackgroundActive ? 'block' : 'none' }}>
+      <div className="fixed inset-0 pointer-events-none z-[5]" style={{ display: uiVisible ? 'block' : 'none' }}>
         <div
           className="absolute inset-0"
           style={{
@@ -1022,48 +1086,112 @@ const App: React.FC = () => {
           </div>
         </motion.div>
       )}
-      <NetworkSphereModal
-        isOpen={isSphereOpen} onClose={() => { setIsSphereOpen(false); setSpherePreview(null); setSpherePreviewApi(null); }}
-        onSelectSensor={(idx, timeIndex) => {
-          setManualTObsOverride(Number.isFinite(timeIndex) ? Math.floor(timeIndex) : null);
-          setSensor(idx);
-          setIsSphereOpen(false);
-          setSpherePreview(null);
-          setSpherePreviewApi(null);
-        }}
-        onToggleViewMode={() => setPanoramaMode((p) => p === 'congestion' ? 'segment' : 'congestion')}
-        graphData={graphData}
-        globalLevels={(isSphereOpen ? spherePreviewApi?.global_state?.current_levels : undefined) ?? api?.global_state?.current_levels ?? api?.global_state?.pred_levels ?? []}
-        globalScores={(isSphereOpen ? spherePreviewApi?.global_state?.current_scores : undefined) ?? api?.global_state?.current_scores ?? api?.global_state?.pred_scores ?? []}
-        selectedSensor={sensor}
-        highlightedSensor={spherePreview?.sensor ?? null}
-        viewMode={panoramaMode}
-        sensorCount={nSensors}
-        currentTimeIndex={api?.meta?.t_obs}
-        currentSimTime={(isSphereOpen ? spherePreviewApi?.meta?.sim_time : undefined) ?? api?.meta?.sim_time ?? null}
-        maxTimeIndex={(api?.dataset_context?.time_steps ?? 1) - 1}
-        previewSensor={spherePreview?.sensor ?? null}
-        previewTimeIndex={spherePreview?.tObs ?? null}
-        selectedMonth={sphereDateSelection?.month}
-        selectedDay={sphereDateSelection?.day}
-        weatherCondition={sphereWeatherVisual.displayCondition}
-        weatherLabel={sphereWeatherVisual.label}
-        weatherTempC={sphereWeather?.temp_c}
-        weatherPrecipitationPct={sphereWeather?.precipitation_pct}
-        onDateChange={(month, day) => {
-          setSphereDateSelection((prev) => {
-            const next = { month: clampMonth(month), day: clampDay(month, day) };
-            if (prev && prev.month === next.month && prev.day === next.day) return prev;
-            return next;
-          });
-        }}
-        onPreviewChange={(previewSensor, previewTimeIndex) => {
-          setSpherePreview((prev) => {
-            if (prev && prev.sensor === previewSensor && prev.tObs === previewTimeIndex) return prev;
-            return { sensor: previewSensor, tObs: previewTimeIndex };
-          });
-        }}
-      />
+
+      {api && (
+        <motion.div
+          className="pointer-events-none fixed inset-0 z-[45] bg-black"
+          initial={false}
+          animate={{ opacity: isSphereOpen ? 1 : 0 }}
+          transition={{ duration: 0.42, ease: [0.22, 1, 0.36, 1] }}
+        />
+      )}
+
+      {api && (
+        <div
+          className={`fixed inset-0 ${isSphereOpen || sphereTransitioning ? 'z-50' : 'z-40'} ${isSphereOpen ? 'pointer-events-auto' : 'pointer-events-none'}`}
+          aria-hidden={false}
+        >
+          <motion.div
+            className="absolute inset-0 overflow-hidden bg-transparent [transform-origin:center_center]"
+            initial={false}
+            animate={
+              isSphereOpen
+                ? { x: 0, y: 0, scale: 1 }
+                : {
+                    x: networkSphereEntryTransition.x,
+                    y: networkSphereEntryTransition.y,
+                    scale: networkSphereEntryTransition.scale,
+                  }
+            }
+            transition={{ type: 'spring', stiffness: 95, damping: 19, mass: 0.9 }}
+            style={{ pointerEvents: sphereExpandedUi ? 'auto' : 'none' }}
+            onAnimationComplete={() => {
+              setSphereTransitioning(false);
+              if (isSphereOpen) {
+                setSphereExpandedUi(true);
+                return;
+              }
+              setSpherePreview(null);
+              setSpherePreviewApi(null);
+            }}
+          >
+            <div className="absolute inset-0 overflow-hidden">
+              <NetworkSphereModal
+                isOpen
+                onClose={closeNetworkSphere}
+                onSelectSensor={(idx, timeIndex) => {
+                  setManualTObsOverride(Number.isFinite(timeIndex) ? Math.floor(timeIndex) : null);
+                  setSensor(idx);
+                  closeNetworkSphere();
+                }}
+                onToggleViewMode={() => setPanoramaMode((p) => p === 'congestion' ? 'segment' : 'congestion')}
+                graphData={graphData}
+                globalLevels={(sphereExpandedUi ? spherePreviewApi?.global_state?.current_levels : undefined) ?? api.global_state?.current_levels ?? api.global_state?.pred_levels ?? []}
+                globalScores={(sphereExpandedUi ? spherePreviewApi?.global_state?.current_scores : undefined) ?? api.global_state?.current_scores ?? api.global_state?.pred_scores ?? []}
+                selectedSensor={sensor}
+                highlightedSensor={sphereExpandedUi ? spherePreview?.sensor ?? null : null}
+                viewMode={panoramaMode}
+                compactOrb={sphereCompactOrb}
+                sensorCount={nSensors}
+                currentTimeIndex={api.meta.t_obs}
+                currentSimTime={(sphereExpandedUi ? spherePreviewApi?.meta?.sim_time : undefined) ?? api.meta.sim_time ?? null}
+                maxTimeIndex={(api.dataset_context?.time_steps ?? 1) - 1}
+                previewSensor={sphereExpandedUi ? spherePreview?.sensor ?? sensor : sensor}
+                previewTimeIndex={sphereExpandedUi ? spherePreview?.tObs ?? api.meta.t_obs : api.meta.t_obs}
+                selectedMonth={sphereDateSelection?.month}
+                selectedDay={sphereDateSelection?.day}
+                weatherCondition={sphereWeatherVisual.displayCondition}
+                weatherLabel={sphereWeatherVisual.label}
+                weatherTempC={sphereWeather?.temp_c}
+                weatherPrecipitationPct={sphereWeather?.precipitation_pct}
+                focusRequestKey={sphereFocusRequestKey}
+                renderFps={sphereRenderFps}
+                onDateChange={isSphereOpen ? (month, day) => {
+                  setSphereDateSelection((prev) => {
+                    const next = { month: clampMonth(month), day: clampDay(month, day) };
+                    if (prev && prev.month === next.month && prev.day === next.day) return prev;
+                    return next;
+                  });
+                } : undefined}
+                onPreviewChange={isSphereOpen ? (previewSensor, previewTimeIndex) => {
+                  setSpherePreview((prev) => {
+                    if (prev && prev.sensor === previewSensor && prev.tObs === previewTimeIndex) return prev;
+                    return { sensor: previewSensor, tObs: previewTimeIndex };
+                  });
+                } : undefined}
+              />
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {sphereTransitioning && (
+        <div
+          className="fixed inset-0 z-[60] cursor-wait"
+          aria-hidden="true"
+          onPointerDown={(event) => event.preventDefault()}
+          onPointerMove={(event) => event.preventDefault()}
+          onWheel={(event) => event.preventDefault()}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+        />
+      )}
 
       <div
         className="fixed left-0 top-0 z-10 overflow-hidden"
@@ -1072,10 +1200,20 @@ const App: React.FC = () => {
         <motion.div
           className="relative flex h-full w-full"
           initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: uiVisible ? (isSphereOpen ? 0 : 1) : 0, y: uiVisible ? (isSphereOpen ? 10 : 0) : 12 }}
+          animate={{ opacity: uiVisible ? 1 : 0, y: uiVisible ? 0 : 12 }}
           transition={{ duration: 0.45, ease: [0.16, 1, 0.3, 1] }}
           style={{ pointerEvents: dashboardChromeVisible ? 'auto' : 'none' }}
         >
+          {api && !isSphereOpen && !sphereTransitioning && (
+            <>
+              <button
+                type="button"
+                onClick={openNetworkSphere}
+                className="pointer-events-auto absolute left-[36px] top-[36px] z-40 h-[248px] w-[248px] cursor-pointer rounded-full bg-transparent"
+                aria-label="打开星图"
+              />
+            </>
+          )}
           <main className="flex-1 min-w-0 flex flex-col h-full relative z-10 pt-28 overflow-hidden pointer-events-none">
           {api && (
             <>
@@ -1085,27 +1223,29 @@ const App: React.FC = () => {
                   
                   {/* Left: Trend Analysis (Flexible) */}
                   <div className="absolute left-0 top-6 bottom-0 right-[980px] pr-6">
-                    <div className="h-full">
+                    <div className="relative h-full">
                       {activeChart && (
-                        <ForecastChart
-                          data={activeChart.data}
-                          predictionStartIdx={predictionStartIdx}
-                          metricLabel={activeChart.metricLabel}
-                          unit={activeChart.unit}
-                          simTime={api.meta.sim_time}
-                          forcedMax={activeChart.limit}
-                          branchPredicted={activeChart.branchPredicted}
-                          branchLabel={weatherOverrideEnabled ? `${WEATHER_PRESETS.find((preset) => preset.key === weatherPreset)?.label ?? '天气'}模拟分支` : undefined}
-                          accidents={api.accidents ?? null}
-                          onOpenNetworkSphere={openNetworkSphere}
-                        />
+                        <div className="absolute bottom-0 left-0 right-0">
+                          <ForecastChart
+                            data={activeChart.data}
+                            predictionStartIdx={predictionStartIdx}
+                            metricLabel={activeChart.metricLabel}
+                            unit={activeChart.unit}
+                            simTime={api.meta.sim_time}
+                            forcedMax={activeChart.limit}
+                            dailyCongestion={api.daily_congestion}
+                            branchPredicted={activeChart.branchPredicted}
+                            branchLabel={weatherOverrideEnabled ? `${WEATHER_PRESETS.find((preset) => preset.key === weatherPreset)?.label ?? '天气'}模拟分支` : undefined}
+                            accidents={api.accidents ?? null}
+                          />
+                        </div>
                       )}
                     </div>
                   </div>
 
                   {/* Right: Real-time Telemetry (HUD BAY) */}
                   <div className="absolute right-0 bottom-0 top-6 w-[980px] border-l border-white/5 pl-6">
-                    {backgroundLedMode && ledWeatherRing ? (
+                    {ledWeatherRing ? (
                       <div className="relative h-full w-full overflow-visible">
                         <div
                           className="pointer-events-auto absolute"
@@ -1171,6 +1311,23 @@ const App: React.FC = () => {
       </div>
     </div>
   );
+};
+
+const App: React.FC = () => {
+  const [appView, setAppView] = useState<AppView>(() => getAppView());
+
+  useEffect(() => {
+    const syncAppView = () => setAppView(getAppView());
+
+    window.addEventListener('hashchange', syncAppView);
+    return () => window.removeEventListener('hashchange', syncAppView);
+  }, []);
+
+  if (appView === 'v2') {
+    return <V2BlankPage />;
+  }
+
+  return <DashboardV1Page />;
 };
 
 export default App;

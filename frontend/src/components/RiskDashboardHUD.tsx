@@ -39,9 +39,9 @@ const RiskDashboardHUD: React.FC<RiskDashboardHUDProps> = ({
   const startAngle = 0.3;     // Clamp Right
   const endAngle = 270;       // Clamp Top
   const totalSweep = 269.7;   // Total Sweep (Avoiding Top-Right Ring Cluster)
-  const hudScale = 1.65;
-  const hudOffsetX = -520;
-  const hudOffsetY = -170;
+  const hudScale = 1.82;
+  const hudOffsetX = -639;
+  const hudOffsetY = -220;
 
   const ringConfigs = useMemo(() => [
     { key: 'speed' as const, ...metrics.speed, x: 780, y: 160, r: 80, icon: <Activity size={24} /> },
@@ -61,7 +61,7 @@ const RiskDashboardHUD: React.FC<RiskDashboardHUDProps> = ({
   const statusColor = totalRisk > 7 ? '#ef4444' : totalRisk > 4 ? '#f59e0b' : '#22d3ee';
 
   return (
-    <div className="relative w-full min-h-[620px] select-none">
+    <div className="relative w-full min-h-[660px] select-none">
       <svg
         width="1100"
         height="500"
@@ -119,7 +119,7 @@ const RiskDashboardHUD: React.FC<RiskDashboardHUDProps> = ({
                      const y2 = arcCenterY + (arcRadius + (isMajor ? 15 : 8)) * Math.sin(angle);
 
                      const isRiskSelected = selectedMetric === 'risk';
-                     const activeColor = isRiskSelected ? '#22d3ee' : '#f8fafc';
+                     const activeColor = isRiskSelected ? '#22c55e' : '#f8fafc';
 
                      return (
                        <motion.line
@@ -130,7 +130,6 @@ const RiskDashboardHUD: React.FC<RiskDashboardHUDProps> = ({
                          initial={{ opacity: 0 }}
                          animate={{ opacity: 1 }}
                          transition={{ delay: i * 0.005 }}
-                         filter={isRiskSelected ? "url(#glow)" : undefined}
                        />
                      );
                    })}
@@ -263,9 +262,9 @@ const RiskDashboardHUD: React.FC<RiskDashboardHUDProps> = ({
                         <div className={`transition-transform duration-300 ${isSelected ? 'scale-110' : 'scale-100'}`} style={{ color: cfg.color }}>
                           {cfg.icon}
                         </div>
-                        <div className="mt-2 flex flex-col items-center">
+                        <div className="mt-2 flex flex-col items-center text-white">
                            <span className="text-lg font-black text-white leading-none">{(cfg.current).toFixed(1)}</span>
-                           <span className="mt-0.5 text-[8px] font-bold uppercase tracking-wider text-zinc-500">{cfg.unit}</span>
+                           <span className="mt-0.5 text-xs font-black uppercase leading-none text-white">{cfg.unit}</span>
                         </div>
                      </div>
                   </foreignObject>

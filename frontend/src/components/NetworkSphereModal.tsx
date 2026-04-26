@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useMemo } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Cloud, CloudDrizzle, CloudFog, CloudLightning, CloudRain, CloudSun, Sun, Wind } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -37,6 +37,18 @@ interface NetworkSphereModalProps {
   weatherLabel?: string;
   weatherTempC?: number;
   weatherPrecipitationPct?: number;
+  compactOrb?: boolean;
+  focusRequestKey?: number;
+  snapshotRequestKey?: number;
+  onSnapshot?: (dataUrl: string) => void;
+  onFocusSettled?: (focusRequestKey: number) => void;
+  onLiveReady?: () => void;
+  renderFps?: number;
+  entryTransition?: {
+    x: number;
+    y: number;
+    scale: number;
+  };
 }
 
 export interface RegionNation {
@@ -55,26 +67,77 @@ const SPHERE_R = 2.0;
 const PHI = Math.PI * (3 - Math.sqrt(5));
 const MIN_CAMERA_DISTANCE = 3.8;
 const MAX_CAMERA_DISTANCE = 9.0;
-const MIN_ROTATE_SPEED = 0.9;
-const MAX_ROTATE_SPEED = 4.0;
+const MIN_ROTATE_SPEED = 0.22;
+const MAX_ROTATE_SPEED = 0.9;
 const TIME_WIDGET_RADIUS = 60;
 const DAY_WIDGET_ITEM_HEIGHT = 30;
 const DAY_WIDGET_VIEWPORT_HEIGHT = 120;
 const DAY_WIDGET_CENTER_PADDING = (DAY_WIDGET_VIEWPORT_HEIGHT - DAY_WIDGET_ITEM_HEIGHT) / 2;
 const DAY_WIDGET_SCROLL_ANIMATION_MS = 220;
-const DAY_WIDGET_WHEEL_COOLDOWN_MS = 140;
+const DAY_WIDGET_WHEEL_COOLDOWN_MS = DAY_WIDGET_SCROLL_ANIMATION_MS + 40;
+const DAY_WIDGET_PROGRAMMATIC_LOCK_MS = DAY_WIDGET_SCROLL_ANIMATION_MS + 80;
 const SENSOR_WIDGET_MIN_WIDTH = 56;
 const SENSOR_WIDGET_MAX_WIDTH = 320;
 const SENSOR_WIDGET_ANIMATION_MS = 500;
 const SENSOR_HANDLE_WIDTH = 28;
 const DAY_START_SLOT = 0;
-const CAMERA_FOCUS_LERP = 0.045;
+const DEFAULT_CAMERA_DISTANCE = 6.5;
+const GLOBE_ZOOM_SPEED = 0.55;
 const CAMERA_FOCUS_DONE_EPS_SQ = 0.000001;
+const CAMERA_DISTANCE_DONE_EPS = 0.002;
+const CAMERA_FOCUS_SNAP_ANGLE = 0.0015;
+const CAMERA_FOCUS_SNAP_UP_DISTANCE = 0.002;
+const CAMERA_FOCUS_MIN_DURATION = 0.08;
+const CAMERA_FOCUS_MAX_DURATION = 0.95;
+const CAMERA_FOCUS_ANGULAR_SPEED = 2.6;
+const CAMERA_FOCUS_DISTANCE_SPEED = 7.0;
+const CAMERA_FOCUS_UP_SPEED = 5.0;
 const DAYS_IN_MONTH_2023 = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const MONTH_MAPPING = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 const FINAL_ANGLES = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180];
 const COLLAPSED_ANGLES = Array.from({ length: 12 }, (_, i) => -45 + i * (90 / 11));
 const NETWORK_STRIP_VISIBLE_COUNT = 19;
+const SELECTOR_BASE_WIDTH = 656;
+const SELECTOR_BASE_HEIGHT = 200;
+const WEATHER_ICON_BASE_SIZE = 76;
+
+type OverlayViewport = {
+  width: number;
+  height: number;
+};
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function getOverlayViewport(): OverlayViewport {
+  if (typeof window === 'undefined') return { width: 1440, height: 900 };
+  return {
+    width: Math.max(1, window.innerWidth),
+    height: Math.max(1, window.innerHeight),
+  };
+}
+
+function useOverlayViewport(active: boolean): OverlayViewport {
+  const [viewport, setViewport] = useState<OverlayViewport>(() => getOverlayViewport());
+
+  useEffect(() => {
+    if (!active || typeof window === 'undefined') return;
+    let raf = 0;
+    const update = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => setViewport(getOverlayViewport()));
+    };
+    update();
+    window.addEventListener('resize', update);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', update);
+    };
+  }, [active]);
+
+  return viewport;
+}
 
 function clampMonth(month: number) {
   const m = Math.floor(month);
@@ -117,6 +180,20 @@ function monthDayToTObs(month: number, day: number, slot: number, maxTimeIndex: 
   return Math.max(0, Math.min(Math.max(0, maxTimeIndex), idx));
 }
 
+function tObsSlot(tObs: number): number {
+  const slot = Math.floor(Number.isFinite(tObs) ? tObs : 0) % 288;
+  return Math.max(0, Math.min(287, slot < 0 ? slot + 288 : slot));
+}
+
+function monthDayToPreviewTObs(month: number, day: number, currentTObs: number, maxTimeIndex: number): number {
+  const target = { month: clampMonth(month), day: clampDay(month, day) };
+  const current = tObsToMonthDay(currentTObs);
+  const slot = current.month === target.month && current.day === target.day
+    ? tObsSlot(currentTObs)
+    : DAY_START_SLOT;
+  return monthDayToTObs(target.month, target.day, slot, maxTimeIndex);
+}
+
 function clampSensorId(sensorId: number, sensorCount: number): number {
   const safeCount = Math.max(1, Math.floor(sensorCount));
   return Math.max(1, Math.min(safeCount, Math.round(sensorId)));
@@ -142,9 +219,17 @@ function easeOutQuart(x: number): number {
   return 1 - Math.pow(1 - x, 4);
 }
 
+function easeOutCubic(x: number): number {
+  return 1 - Math.pow(1 - x, 3);
+}
+
+function angularDistance(a: THREE.Vector3, b: THREE.Vector3) {
+  return Math.acos(THREE.MathUtils.clamp(a.dot(b), -1, 1));
+}
+
 function getRenderPixelRatio(width: number, height: number) {
   const maxPixelRatio = width * height >= 1600 * 900 ? 1 : 1.25;
-  return Math.min(window.devicePixelRatio || 1, maxPixelRatio);
+  return Math.max(1, Math.min(window.devicePixelRatio || 1, maxPixelRatio));
 }
 
 /* ─────────────────── Helpers ─────────────────── */
@@ -243,6 +328,27 @@ function congestionPercentFromSensors(sensorIds: number[], levels: number[], sco
 function normalizeRoadValue(value: unknown, fallback: string) {
   const raw = String(value ?? '').trim();
   return raw.length > 0 && raw.toLowerCase() !== 'nan' ? raw : fallback;
+}
+
+function buildFallbackGraphData(sensorCount: number) {
+  const routes = ['I-5', 'I-80', 'US-50', 'CA-99', 'SR-51', 'SR-65', 'SR-70', 'I-580', 'I-680', 'CA-160', 'CA-244', 'SR-99'];
+  const directions = ['NB', 'SB', 'EB', 'WB'];
+  const safeCount = Math.max(1, Math.floor(sensorCount));
+
+  return {
+    nodes: Array.from({ length: safeCount }, (_, index) => {
+      const routeIndex = index % routes.length;
+      const laneIndex = Math.floor(index / routes.length);
+      return {
+        freeway: routes[routeIndex],
+        direction: directions[(routeIndex + laneIndex) % directions.length],
+        abs_pm: laneIndex * 1.65 + routeIndex * 0.08,
+        station_name: `${routes[routeIndex]} Sensor ${String(index + 1).padStart(3, '0')}`,
+      };
+    }),
+    links: [],
+    metadata: { source: 'fallback-network-sphere' },
+  };
 }
 
 function getRoadSegmentMeta(node: any) {
@@ -652,6 +758,13 @@ function buildScene(
     globalLevels: number[];
     globalScores?: number[];
     viewMode: PanoramaMode;
+    compactOrb?: boolean;
+    focusRequestKey?: number;
+    snapshotRequestKey?: number;
+    onSnapshot?: (dataUrl: string) => void;
+    onFocusSettled?: (focusRequestKey: number) => void;
+    onLiveReady?: () => void;
+    renderFps?: number;
   }>,
   sceneActiveRef: React.MutableRefObject<boolean>,
   onSelectSensor: (idx: number) => void,
@@ -672,7 +785,13 @@ function buildScene(
     return () => {};
   }
 
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  const renderer = new THREE.WebGLRenderer({
+    canvas,
+    antialias: true,
+    alpha: true,
+    powerPreference: 'high-performance',
+    preserveDrawingBuffer: Boolean(latestProps.current.onSnapshot),
+  });
   renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
   renderer.setPixelRatio(getRenderPixelRatio(canvas.clientWidth, canvas.clientHeight));
 
@@ -682,7 +801,7 @@ function buildScene(
     camera,
     sensorPositions,
     latestProps.current.highlightedSensor ?? latestProps.current.selectedSensor,
-    6.5,
+    DEFAULT_CAMERA_DISTANCE,
   );
   
   const getNationLevel = (nationIdx: number, levels: number[]) => {
@@ -698,7 +817,7 @@ function buildScene(
   const controls = new TrackballControls(camera, canvas);
   controls.noPan = true;
   controls.rotateSpeed = MAX_ROTATE_SPEED;
-  controls.zoomSpeed = 1.0;
+  controls.zoomSpeed = GLOBE_ZOOM_SPEED;
   controls.minDistance = MIN_CAMERA_DISTANCE;
   controls.maxDistance = MAX_CAMERA_DISTANCE;
   controls.staticMoving = false; // Set to false to enable damping/inertia
@@ -957,6 +1076,10 @@ function buildScene(
   let activeFocusSensor = latestProps.current.highlightedSensor ?? latestProps.current.selectedSensor;
   let activeViewMode = latestProps.current.viewMode;
   let activeGlobalLevels = latestProps.current.globalLevels;
+  let activeFocusRequestKey = latestProps.current.focusRequestKey ?? 0;
+  let activeSnapshotRequestKey = latestProps.current.snapshotRequestKey ?? 0;
+  let pendingFocusSettledKey: number | null = null;
+  let liveReadyReported = false;
   let pulseOriginSensor = activeFocusSensor;
   let pulseElapsed = 0;
   // 加快脉冲速度
@@ -984,7 +1107,71 @@ function buildScene(
   let minSwitchInterval = 0.3; // 最小切换间隔（秒）
   const cameraTargetDir = camera.position.clone().normalize();
   const cameraTargetUp = camera.up.clone();
+  let cameraTargetDistance = camera.position.length();
+  const cameraFocusStartDir = cameraTargetDir.clone();
+  const cameraFocusStartUp = cameraTargetUp.clone();
+  const cameraFocusRotation = new THREE.Quaternion();
+  const cameraFocusStepRotation = new THREE.Quaternion();
+  let cameraFocusStartDistance = cameraTargetDistance;
+  let cameraFocusElapsed = 0;
+  let cameraFocusDuration = CAMERA_FOCUS_MIN_DURATION;
   let cameraFocusTransitionActive = false;
+
+  const settleCameraFocus = () => {
+    camera.position.copy(cameraTargetDir).multiplyScalar(cameraTargetDistance);
+    camera.up.copy(cameraTargetUp);
+    camera.lookAt(0, 0, 0);
+    controls.target.set(0, 0, 0);
+    cameraFocusTransitionActive = false;
+    if (pendingFocusSettledKey !== null) {
+      latestProps.current.onFocusSettled?.(pendingFocusSettledKey);
+      pendingFocusSettledKey = null;
+    }
+  };
+
+  const startCameraFocusTransition = (
+    targetDir: THREE.Vector3,
+    targetUp: THREE.Vector3,
+    targetDistance: number,
+    settleKey: number | null,
+  ) => {
+    cameraTargetDir.copy(targetDir).normalize();
+    cameraTargetUp.copy(targetUp).normalize();
+    cameraTargetDistance = targetDistance;
+    pendingFocusSettledKey = settleKey;
+
+    const currentDir = camera.position.clone().normalize();
+    const currentUp = camera.up.clone().normalize();
+    const currentDistance = camera.position.length();
+    const angleDelta = angularDistance(currentDir, cameraTargetDir);
+    const upDelta = currentUp.distanceTo(cameraTargetUp);
+    const distanceDelta = Math.abs(currentDistance - cameraTargetDistance);
+
+    if (
+      angleDelta < CAMERA_FOCUS_SNAP_ANGLE &&
+      upDelta < CAMERA_FOCUS_SNAP_UP_DISTANCE &&
+      distanceDelta < CAMERA_DISTANCE_DONE_EPS
+    ) {
+      settleCameraFocus();
+      return;
+    }
+
+    cameraFocusStartDir.copy(currentDir);
+    cameraFocusStartUp.copy(currentUp);
+    cameraFocusRotation.setFromUnitVectors(cameraFocusStartDir, cameraTargetDir);
+    cameraFocusStartDistance = currentDistance;
+    cameraFocusElapsed = 0;
+    cameraFocusDuration = THREE.MathUtils.clamp(
+      Math.max(
+        angleDelta / CAMERA_FOCUS_ANGULAR_SPEED,
+        distanceDelta / CAMERA_FOCUS_DISTANCE_SPEED,
+        upDelta / CAMERA_FOCUS_UP_SPEED,
+      ),
+      CAMERA_FOCUS_MIN_DURATION,
+      CAMERA_FOCUS_MAX_DURATION,
+    );
+    cameraFocusTransitionActive = true;
+  };
 
   const setPulseOrigin = (originSensor: number) => {
     pulseOriginSensor = originSensor >= 0 && originSensor < sensorCount ? originSensor : 0;
@@ -1150,16 +1337,28 @@ function buildScene(
   canvas.addEventListener('mouseleave', onMouseLeave);
 
   /* ── Resize handler ── */
+  let renderWidth = 0;
+  let renderHeight = 0;
   const onResize = () => {
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
+    const w = Math.max(1, Math.floor(canvas.clientWidth));
+    const h = Math.max(1, Math.floor(canvas.clientHeight));
+    if (w === renderWidth && h === renderHeight) return;
+    renderWidth = w;
+    renderHeight = h;
     renderer.setSize(w, h, false);
     renderer.setPixelRatio(getRenderPixelRatio(w, h));
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     controls.handleResize();
+    markHoverDirty();
   };
   window.addEventListener('resize', onResize);
+  const resizeObserver = typeof ResizeObserver !== 'undefined'
+    ? new ResizeObserver(onResize)
+    : null;
+  resizeObserver?.observe(canvas);
+  if (canvas.parentElement) resizeObserver?.observe(canvas.parentElement);
+  onResize();
 
   /* ── Atmospheric Global Shell (Average of all 12 as a base) ── */
   // Removed: atmospheric shell with scanning rings - now using clean transparent globe
@@ -1209,6 +1408,7 @@ function buildScene(
   let animId = 0;
   let elapsed = 0;
   let lastFrame = performance.now();
+  let lastRenderAt = 0;
   let fpsLastSampleAt = lastFrame;
   let fpsFrames = 0;
   let lastDist = camera.position.length(); // 使用实际相机距离初始化
@@ -1217,17 +1417,24 @@ function buildScene(
   const animate = () => {
     animId = requestAnimationFrame(animate);
     const now = performance.now();
-    const dt = (now - lastFrame) / 1000;
-    lastFrame = now;
-    elapsed += dt;
     if (!sceneActiveRef.current) {
       if (fpsFrames !== 0) {
         fpsFrames = 0;
         fpsLastSampleAt = now;
         onFpsUpdate?.(0);
       }
+      lastFrame = now;
       return;
     }
+
+    const targetFps = Number(latestProps.current.renderFps ?? 0);
+    const minFrameMs = Number.isFinite(targetFps) && targetFps > 0 ? 1000 / targetFps : 0;
+    if (minFrameMs > 0 && lastRenderAt > 0 && now - lastRenderAt < minFrameMs) return;
+    lastRenderAt = now;
+
+    const dt = Math.min(0.05, (now - lastFrame) / 1000);
+    lastFrame = now;
+    elapsed += dt;
 
     fpsFrames += 1;
     if (onFpsUpdate && now - fpsLastSampleAt >= 250) {
@@ -1282,9 +1489,11 @@ function buildScene(
     const { selectedSensor, highlightedSensor, viewMode } = latestProps.current;
     const normalizedHighlighted = highlightedSensor ?? -1;
     const focusSensor = highlightedSensor ?? selectedSensor;
+    const focusRequestKey = latestProps.current.focusRequestKey ?? 0;
     const sensorChanged = selectedSensor !== activeSelectedSensor;
     const highlightedChanged = normalizedHighlighted !== activeHighlightedSensor;
     const focusChanged = focusSensor !== activeFocusSensor;
+    const focusRequested = focusRequestKey !== activeFocusRequestKey;
     const modeChanged = viewMode !== activeViewMode;
     const levelsChanged = latestProps.current.globalLevels !== activeGlobalLevels;
     if (
@@ -1293,6 +1502,7 @@ function buildScene(
       sensorChanged ||
       highlightedChanged ||
       focusChanged ||
+      focusRequested ||
       modeChanged ||
       levelsChanged
     ) {
@@ -1324,15 +1534,20 @@ function buildScene(
         } else if ((sensorChanged || highlightedChanged || focusChanged) && activeViewMode === 'segment' && !congestionTransitionActive && congestionTransitionTarget === 0) {
           faceColorsNeedUpdate = true;
         }
-        if (focusChanged) {
-          const nextPose = getCameraFocusPose(sensorPositions, focusSensor, camera.position.length());
-          cameraTargetDir.copy(nextPose.position).normalize();
-          cameraTargetUp.copy(nextPose.up);
-          cameraFocusTransitionActive = true;
+        if (focusChanged || focusRequested) {
+          const targetDistance = focusRequested ? DEFAULT_CAMERA_DISTANCE : camera.position.length();
+          const nextPose = getCameraFocusPose(sensorPositions, focusSensor, targetDistance);
+          startCameraFocusTransition(
+            nextPose.position,
+            nextPose.up,
+            targetDistance,
+            focusRequested ? focusRequestKey : null,
+          );
         }
         activeSelectedSensor = selectedSensor;
         activeHighlightedSensor = normalizedHighlighted;
         activeFocusSensor = focusSensor;
+        activeFocusRequestKey = focusRequestKey;
         activeViewMode = viewMode;
     }
 
@@ -1457,19 +1672,27 @@ function buildScene(
     }
 
     if (cameraFocusTransitionActive) {
-      const cameraDistance = camera.position.length();
-      const nextDir = camera.position.clone().normalize().lerp(cameraTargetDir, CAMERA_FOCUS_LERP);
+      cameraFocusElapsed += dt;
+      const progress = THREE.MathUtils.clamp(cameraFocusElapsed / Math.max(cameraFocusDuration, 0.001), 0, 1);
+      const eased = easeOutCubic(progress);
+      cameraFocusStepRotation.identity().slerp(cameraFocusRotation, eased);
+      const nextDir = cameraFocusStartDir.clone().applyQuaternion(cameraFocusStepRotation);
+      const nextDistance = THREE.MathUtils.lerp(cameraFocusStartDistance, cameraTargetDistance, eased);
       if (nextDir.lengthSq() > 0.000001) {
-        camera.position.copy(nextDir.normalize().multiplyScalar(cameraDistance));
+        camera.position.copy(nextDir.normalize().multiplyScalar(nextDistance));
       }
-      camera.up.lerp(cameraTargetUp, CAMERA_FOCUS_LERP).normalize();
+      camera.up.copy(cameraFocusStartUp).lerp(cameraTargetUp, eased).normalize();
       camera.lookAt(0, 0, 0);
       controls.target.set(0, 0, 0);
       if (
-        camera.position.clone().normalize().distanceToSquared(cameraTargetDir) < CAMERA_FOCUS_DONE_EPS_SQ &&
-        camera.up.distanceToSquared(cameraTargetUp) < CAMERA_FOCUS_DONE_EPS_SQ
+        progress >= 1 ||
+        (
+          camera.position.clone().normalize().distanceToSquared(cameraTargetDir) < CAMERA_FOCUS_DONE_EPS_SQ &&
+          camera.up.distanceToSquared(cameraTargetUp) < CAMERA_FOCUS_DONE_EPS_SQ &&
+          Math.abs(camera.position.length() - cameraTargetDistance) < CAMERA_DISTANCE_DONE_EPS
+        )
       ) {
-        cameraFocusTransitionActive = false;
+        settleCameraFocus();
       }
     }
 
@@ -1542,12 +1765,16 @@ function buildScene(
        // 3. Direct crossfade between congestion and segment ownership overlays
        const iconOp = Math.max(0, Math.min(1, (dist - 4.5) / 2.0)) * 0.9;
        const currentMode = latestProps.current.viewMode;
+       const compactOrb = latestProps.current.compactOrb ?? false;
        
        // 计算目标透明度
        let targetCongestionOpacity = 0;
        let targetSegmentOpacity = 0;
        
-       if (currentMode === 'congestion') {
+       if (compactOrb) {
+         targetCongestionOpacity = 0;
+         targetSegmentOpacity = 0;
+       } else if (currentMode === 'congestion') {
          // 拥堵模式：显示拥堵百分比
          targetCongestionOpacity = iconOp;
        } else {
@@ -1555,10 +1782,17 @@ function buildScene(
          targetSegmentOpacity = iconOp;
        }
        
-       // 平滑过渡（使用 lerp 插值）
-       const transitionSpeed = 0.12; // 过渡速度
-       wi.currentCongestionOpacity = THREE.MathUtils.lerp(wi.currentCongestionOpacity, targetCongestionOpacity, transitionSpeed);
-       wi.currentSegmentOpacity = THREE.MathUtils.lerp(wi.currentSegmentOpacity, targetSegmentOpacity, transitionSpeed);
+       if (compactOrb) {
+         // Snapshot mode must be clean immediately; otherwise a fast focus reset can
+         // capture partially faded percentage labels.
+         wi.currentCongestionOpacity = 0;
+         wi.currentSegmentOpacity = 0;
+       } else {
+         // 平滑过渡（使用 lerp 插值）
+         const transitionSpeed = 0.12; // 过渡速度
+         wi.currentCongestionOpacity = THREE.MathUtils.lerp(wi.currentCongestionOpacity, targetCongestionOpacity, transitionSpeed);
+         wi.currentSegmentOpacity = THREE.MathUtils.lerp(wi.currentSegmentOpacity, targetSegmentOpacity, transitionSpeed);
+       }
        
        // 应用透明度
        wi.congestionMaterial.opacity = wi.currentCongestionOpacity;
@@ -1586,6 +1820,21 @@ function buildScene(
     }
 
     renderer.render(scene, camera);
+
+    if (!liveReadyReported) {
+      liveReadyReported = true;
+      latestProps.current.onLiveReady?.();
+    }
+
+    const snapshotRequestKey = latestProps.current.snapshotRequestKey ?? 0;
+    if (snapshotRequestKey !== activeSnapshotRequestKey) {
+      activeSnapshotRequestKey = snapshotRequestKey;
+      try {
+        latestProps.current.onSnapshot?.(canvas.toDataURL('image/png'));
+      } catch (error) {
+        console.warn('[NetworkSphere] Failed to capture snapshot:', error);
+      }
+    }
   };
   animate();
 
@@ -1593,6 +1842,7 @@ function buildScene(
     cancelAnimationFrame(animId);
     onFpsUpdate?.(0);
     window.removeEventListener('resize', onResize);
+    resizeObserver?.disconnect();
     canvas.removeEventListener('mousedown', onMouseDown);
     canvas.removeEventListener('click', onClick);
     canvas.removeEventListener('mousemove', onMouseMove);
@@ -1652,12 +1902,24 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   weatherLabel,
   weatherTempC,
   weatherPrecipitationPct,
+  compactOrb = false,
+  focusRequestKey = 0,
+  snapshotRequestKey = 0,
+  onSnapshot,
+  onFocusSettled,
+  onLiveReady,
+  renderFps,
+  entryTransition,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
   const sceneActiveRef = useRef(isOpen);
+  const modalExitTimerRef = useRef<number | null>(null);
   const maxTimeIndexRef = useRef(maxTimeIndex);
-  const [hasOpened, setHasOpened] = useState(isOpen);
+  const [shouldRenderModal, setShouldRenderModal] = useState(isOpen);
+  const [isModalTransitioning, setIsModalTransitioning] = useState(false);
+  const modalTransitionMs = compactOrb ? 0 : 720;
+  const effectiveRenderFps = renderFps ?? (isModalTransitioning && !compactOrb ? 30 : undefined);
 
   // Pass dynamic values through a mutable Ref to completely prevent expensive recreating of Three geometries & resetting OrbitCamera!
   const latestProps = useRef({
@@ -1666,6 +1928,13 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     globalLevels,
     globalScores,
     viewMode,
+    compactOrb,
+    focusRequestKey,
+    snapshotRequestKey,
+    onSnapshot,
+    onFocusSettled,
+    onLiveReady,
+    renderFps: effectiveRenderFps,
   });
 
   const [zoomLevel, setZoomLevel] = useState(0); // 0 (far) to 1 (near)
@@ -1696,9 +1965,13 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const dateScrollRef = useRef<HTMLDivElement>(null);
   const lastCommittedPreviewRef = useRef<{ sensor: number; tObs: number } | null>(null);
   const previewCommitTimerRef = useRef<number | null>(null);
+  const effectivePreviewTimeRef = useRef(effectivePreviewTime);
   const isProgrammaticScrollRef = useRef(false);
   const programmaticScrollTimerRef = useRef<number | null>(null);
   const wheelCooldownUntilRef = useRef(0);
+  const wheelCommitTimerRef = useRef<number | null>(null);
+  const timeAnimationFrameRef = useRef<number | null>(null);
+  const timeAnimationRunRef = useRef(0);
   const suppressPreviewCommitRef = useRef(false);
   const sensorDragActiveRef = useRef(false);
   const sensorDragStartXRef = useRef(0);
@@ -1718,9 +1991,110 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   }, [onSelectSensor]);
 
   useEffect(() => {
-    sceneActiveRef.current = isOpen;
-    if (isOpen) setHasOpened(true);
-  }, [isOpen]);
+    effectivePreviewTimeRef.current = effectivePreviewTime;
+  }, [effectivePreviewTime]);
+
+  useEffect(() => {
+    return () => {
+      stopTimeAnimation();
+      clearProgrammaticScrollLock();
+      clearWheelCommitTimer();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const clearProgrammaticScrollLock = () => {
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+      programmaticScrollTimerRef.current = null;
+    }
+    isProgrammaticScrollRef.current = false;
+  };
+
+  const lockProgrammaticScroll = () => {
+    isProgrammaticScrollRef.current = true;
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+    }
+    programmaticScrollTimerRef.current = window.setTimeout(() => {
+      isProgrammaticScrollRef.current = false;
+      programmaticScrollTimerRef.current = null;
+    }, DAY_WIDGET_PROGRAMMATIC_LOCK_MS);
+  };
+
+  const scrollDateWidgetToDay = (
+    day: number,
+    behavior: ScrollBehavior = 'auto',
+    markProgrammatic = true,
+  ) => {
+    const sc = dateScrollRef.current;
+    if (!sc) return;
+    const targetDay = clampDay(widgetSelectionRef.current.month, day);
+    if (markProgrammatic) lockProgrammaticScroll();
+    sc.scrollTo({
+      top: (targetDay - 1) * DAY_WIDGET_ITEM_HEIGHT,
+      behavior,
+    });
+  };
+
+  const clearWheelCommitTimer = () => {
+    if (wheelCommitTimerRef.current !== null) {
+      window.clearTimeout(wheelCommitTimerRef.current);
+      wheelCommitTimerRef.current = null;
+    }
+  };
+
+  const stopTimeAnimation = () => {
+    timeAnimationRunRef.current += 1;
+    if (timeAnimationFrameRef.current !== null) {
+      window.cancelAnimationFrame(timeAnimationFrameRef.current);
+      timeAnimationFrameRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    if (modalExitTimerRef.current !== null) {
+      window.clearTimeout(modalExitTimerRef.current);
+      modalExitTimerRef.current = null;
+    }
+
+    if (isOpen) {
+      setShouldRenderModal(true);
+      setIsModalTransitioning(!compactOrb);
+      sceneActiveRef.current = true;
+      if (modalTransitionMs > 0) {
+        modalExitTimerRef.current = window.setTimeout(() => {
+          setIsModalTransitioning(false);
+          modalExitTimerRef.current = null;
+        }, modalTransitionMs);
+      }
+      return;
+    }
+
+    if (modalTransitionMs <= 0) {
+      sceneActiveRef.current = false;
+      setIsModalTransitioning(false);
+      setShouldRenderModal(false);
+      return;
+    }
+
+    // Keep WebGL alive while the close transform is still moving.
+    sceneActiveRef.current = true;
+    setIsModalTransitioning(true);
+    modalExitTimerRef.current = window.setTimeout(() => {
+      sceneActiveRef.current = false;
+      setIsModalTransitioning(false);
+      setShouldRenderModal(false);
+      modalExitTimerRef.current = null;
+    }, modalTransitionMs);
+
+    return () => {
+      if (modalExitTimerRef.current !== null) {
+        window.clearTimeout(modalExitTimerRef.current);
+        modalExitTimerRef.current = null;
+      }
+    };
+  }, [isOpen, compactOrb, modalTransitionMs]);
 
   useEffect(() => {
     maxTimeIndexRef.current = maxTimeIndex;
@@ -1729,10 +2103,10 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const commitPreviewSelection = (sensorId = widgetSensorIdRef.current) => {
     if (!isOpen || !onPreviewChange) return;
     const nextSensorId = clampSensorId(sensorId, safeSensorCount);
-    const tObs = monthDayToTObs(
+    const tObs = monthDayToPreviewTObs(
       widgetSelectionRef.current.month,
       widgetSelectionRef.current.day,
-      DAY_START_SLOT,
+      effectivePreviewTime,
       maxTimeIndex,
     );
     const previewSensorIdx = nextSensorId - 1;
@@ -1747,6 +2121,8 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       typeof month === 'function' ? month(widgetSelectionRef.current.month) : month,
     );
     const nextDay = clampDay(nextMonth, widgetSelectionRef.current.day);
+    const current = widgetSelectionRef.current;
+    if (current.month === nextMonth && current.day === nextDay) return;
     widgetSelectionRef.current = {
       month: nextMonth,
       day: nextDay,
@@ -1761,6 +2137,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       widgetSelectionRef.current.month,
       typeof day === 'function' ? day(widgetSelectionRef.current.day) : day,
     );
+    if (widgetSelectionRef.current.day === nextDay) return;
     widgetSelectionRef.current = {
       month: widgetSelectionRef.current.month,
       day: nextDay,
@@ -1853,6 +2230,8 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     const md = effectivePreviewDate;
+    const current = widgetSelectionRef.current;
+    if (current.month === md.month && current.day === md.day) return;
     suppressPreviewCommitRef.current = true;
     widgetSelectionRef.current = {
       month: md.month,
@@ -1860,6 +2239,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     };
     setWidgetMonth((prev) => (prev === md.month ? prev : md.month));
     setWidgetDay((prev) => (prev === md.day ? prev : md.day));
+    scrollDateWidgetToDay(md.day, 'auto', true);
   }, [isOpen, effectivePreviewDate.month, effectivePreviewDate.day]);
 
   useEffect(() => {
@@ -1869,7 +2249,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     if (widgetMonth !== md.month || widgetDay !== md.day || widgetSensorId !== expectedSensorId) return;
     lastCommittedPreviewRef.current = {
       sensor: expectedSensorId - 1,
-      tObs: monthDayToTObs(md.month, md.day, DAY_START_SLOT, maxTimeIndex),
+      tObs: monthDayToPreviewTObs(md.month, md.day, effectivePreviewTime, maxTimeIndex),
     };
     suppressPreviewCommitRef.current = false;
   }, [
@@ -1892,24 +2272,25 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   }, [widgetMonth, widgetDay]);
 
   useEffect(() => {
-    if (isOpen) return;
+    if (isOpen && !compactOrb) return;
+    stopTimeAnimation();
+    clearWheelCommitTimer();
     lastCommittedPreviewRef.current = null;
     setTimeTargetExpanded(false);
+    setTimeExpanded(false);
+    setTimeAnimating(false);
+    setDotProgress(Array(12).fill(0));
     setIsSensorInputOpen(false);
     wheelCooldownUntilRef.current = 0;
     sensorDragActiveRef.current = false;
-    isProgrammaticScrollRef.current = false;
+    clearProgrammaticScrollLock();
     suppressPreviewCommitRef.current = false;
     stopSensorAnimation();
     if (previewCommitTimerRef.current !== null) {
       window.clearTimeout(previewCommitTimerRef.current);
       previewCommitTimerRef.current = null;
     }
-    if (programmaticScrollTimerRef.current !== null) {
-      window.clearTimeout(programmaticScrollTimerRef.current);
-      programmaticScrollTimerRef.current = null;
-    }
-  }, [isOpen]);
+  }, [isOpen, compactOrb]);
 
   useEffect(() => {
     if (!isSensorInputOpen || !sensorInputRef.current) return;
@@ -1917,20 +2298,11 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     sensorInputRef.current.select();
   }, [isSensorInputOpen]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!isOpen || !dateScrollRef.current) return;
-    const sc = dateScrollRef.current;
     const day = clampDay(widgetMonth, widgetDay);
-    isProgrammaticScrollRef.current = true;
-    sc.scrollTo({ top: (day - 1) * DAY_WIDGET_ITEM_HEIGHT, behavior: 'auto' });
-    if (programmaticScrollTimerRef.current !== null) {
-      window.clearTimeout(programmaticScrollTimerRef.current);
-    }
-    programmaticScrollTimerRef.current = window.setTimeout(() => {
-      isProgrammaticScrollRef.current = false;
-      programmaticScrollTimerRef.current = null;
-    }, DAY_WIDGET_SCROLL_ANIMATION_MS);
-  }, [isOpen, widgetMonth, effectivePreviewTime]);
+    scrollDateWidgetToDay(day, 'auto', true);
+  }, [isOpen, compactOrb, widgetMonth, selectedMonth, selectedDay, effectivePreviewTime]);
 
   useEffect(() => {
     const onMouseMove = (event: MouseEvent) => {
@@ -1960,7 +2332,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     };
   }, [safeSensorCount, isSensorInputOpen, isOpen, onPreviewChange, maxTimeIndex]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!isOpen || !dateScrollRef.current) return;
     const sc = dateScrollRef.current;
 
@@ -1971,37 +2343,35 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       const deltaY = Number(event.deltaY);
       if (!Number.isFinite(deltaY) || Math.abs(deltaY) < 0.01) return;
 
-      const now = performance.now();
+      const now = Date.now();
       if (now < wheelCooldownUntilRef.current) return;
       wheelCooldownUntilRef.current = now + DAY_WIDGET_WHEEL_COOLDOWN_MS;
 
-      const direction = Math.sign(deltaY);
-      if (direction === 0) return;
+      let currentIndex = Math.round(sc.scrollTop / DAY_WIDGET_ITEM_HEIGHT);
+      if (deltaY > 0) {
+        currentIndex++;
+      } else if (deltaY < 0) {
+        currentIndex--;
+      }
+      currentIndex = Math.max(0, Math.min(currentIndex, getDaysInMonth(widgetMonth) - 1));
+      const nextDay = currentIndex + 1;
 
-      setWidgetDayImmediate((prev) => {
-        const nextDay = clampDay(widgetMonth, prev + direction);
-        if (nextDay !== prev) {
-          isProgrammaticScrollRef.current = true;
-          sc.scrollTo({ top: (nextDay - 1) * DAY_WIDGET_ITEM_HEIGHT, behavior: 'smooth' });
-          if (programmaticScrollTimerRef.current !== null) {
-            window.clearTimeout(programmaticScrollTimerRef.current);
-          }
-          programmaticScrollTimerRef.current = window.setTimeout(() => {
-            isProgrammaticScrollRef.current = false;
-            programmaticScrollTimerRef.current = null;
-          }, DAY_WIDGET_SCROLL_ANIMATION_MS);
-        }
-        return nextDay;
-      });
+      scrollDateWidgetToDay(nextDay, 'smooth', true);
+      clearWheelCommitTimer();
+      wheelCommitTimerRef.current = window.setTimeout(() => {
+        wheelCommitTimerRef.current = null;
+        clearProgrammaticScrollLock();
+        setWidgetDayImmediate(nextDay);
+      }, DAY_WIDGET_SCROLL_ANIMATION_MS);
     };
 
     sc.addEventListener('wheel', onWheel, { passive: false });
     return () => {
       sc.removeEventListener('wheel', onWheel);
     };
-  }, [isOpen, timeExpanded, timeAnimating, widgetMonth]);
+  }, [isOpen, compactOrb, timeExpanded, timeAnimating, widgetMonth]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!isOpen || !dateScrollRef.current) return;
     const sc = dateScrollRef.current;
     const update = (skipStateCommit = false) => {
@@ -2050,7 +2420,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       }
       sc.removeEventListener('scroll', onScroll);
     };
-  }, [isOpen, widgetMonth]);
+  }, [isOpen, compactOrb, widgetMonth]);
 
   useEffect(() => {
     if (!isOpen || !onPreviewChange) return;
@@ -2063,11 +2433,14 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
 
   const toggleTimeAnimation = (toExpand: boolean, selectedMonth?: number) => {
     if (timeAnimating) return;
+    if (toExpand === timeExpanded) return;
     if (selectedMonth !== undefined && selectedMonth !== null) {
       const m = clampMonth(selectedMonth);
       setWidgetMonthImmediate(m);
       setWidgetDayImmediate((prev) => clampDay(m, prev));
+      scrollDateWidgetToDay(widgetSelectionRef.current.day, 'auto', true);
     }
+    stopTimeAnimation();
     setTimeTargetExpanded(toExpand);
     setTimeAnimating(true);
     const duration = 1200;
@@ -2086,7 +2459,9 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     }
 
     let start: number | null = null;
+    const runId = timeAnimationRunRef.current;
     const step = (ts: number) => {
+      if (runId !== timeAnimationRunRef.current) return;
       if (start === null) start = ts;
       const elapsed = ts - start;
       let allDone = true;
@@ -2100,13 +2475,16 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       });
       setDotProgress(next);
       if (!allDone) {
-        requestAnimationFrame(step);
+        timeAnimationFrameRef.current = requestAnimationFrame(step);
       } else {
+        timeAnimationFrameRef.current = null;
         setTimeAnimating(false);
         setTimeExpanded(toExpand);
+        setTimeTargetExpanded(toExpand);
+        setDotProgress(Array(12).fill(toExpand ? 1 : 0));
       }
     };
-    requestAnimationFrame(step);
+    timeAnimationFrameRef.current = requestAnimationFrame(step);
   };
 
   const shouldHideDateWidget = timeExpanded || (timeAnimating && timeTargetExpanded);
@@ -2152,9 +2530,12 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
 
   /* Build exactly 12 Nations mapping using bottom up Edge Stitching */
   const { nations, sensorPositions, borderEdges, cellPolygons } = useMemo(() => {
-    return buildNations(graphData, globalLevels);
+    const sourceGraphData = graphData?.nodes?.length
+      ? graphData
+      : buildFallbackGraphData(safeSensorCount);
+    return buildNations(sourceGraphData, globalLevels);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [graphData]);
+  }, [graphData, safeSensorCount]);
 
   useEffect(() => {
     latestProps.current = {
@@ -2163,13 +2544,33 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       globalLevels,
       globalScores,
       viewMode,
+      compactOrb,
+      focusRequestKey,
+      snapshotRequestKey,
+      onSnapshot,
+      onFocusSettled,
+      onLiveReady,
+      renderFps: effectiveRenderFps,
     };
-  }, [selectedSensor, highlightedSensor, globalLevels, globalScores, viewMode]);
+  }, [
+    selectedSensor,
+    highlightedSensor,
+    globalLevels,
+    globalScores,
+    viewMode,
+    compactOrb,
+    focusRequestKey,
+    snapshotRequestKey,
+    onSnapshot,
+    onFocusSettled,
+    onLiveReady,
+    effectiveRenderFps,
+  ]);
 
   /* Build scene */
   useEffect(() => {
-    if (!hasOpened || !canvasRef.current || nations.length === 0) {
-      if (hasOpened && nations.length === 0) {
+    if (!shouldRenderModal || !canvasRef.current || nations.length === 0) {
+      if (isOpen && nations.length === 0) {
         console.warn('[NetworkSphere] Modal is open but nations are empty. graphData state:', !!graphData);
       }
       return;
@@ -2201,7 +2602,10 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
           sceneActiveRef,
           (sensorIdx) => {
             const { month, day } = widgetSelectionRef.current;
-            latestOnSelectSensorRef.current(sensorIdx, monthDayToTObs(month, day, DAY_START_SLOT, maxTimeIndexRef.current));
+            latestOnSelectSensorRef.current(
+              sensorIdx,
+              monthDayToPreviewTObs(month, day, effectivePreviewTimeRef.current, maxTimeIndexRef.current),
+            );
           },
           (dist: number) => {
             const z = THREE.MathUtils.clamp(
@@ -2225,7 +2629,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       cleanupRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasOpened, nations]);
+  }, [shouldRenderModal, nations]);
 
   // Which nation does the selected sensor belong to?
   const selectedNation = useMemo(() => {
@@ -2261,6 +2665,31 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
       .sort((a, b) => b.percent - a.percent || b.sensorCount - a.sensorCount || a.label.localeCompare(b.label));
   }, [nations, globalLevels, globalScores]);
   const visibleDayCount = getDaysInMonth(widgetMonth);
+  const overlayViewport = useOverlayViewport(isOpen && !compactOrb);
+  const overlayInset = clampNumber(Math.round(Math.min(28, Math.max(12, Math.min(overlayViewport.width, overlayViewport.height) * 0.03))), 12, 28);
+  const selectorScale = clampNumber(
+    Math.min(
+      (overlayViewport.width - overlayInset * 2) / SELECTOR_BASE_WIDTH,
+      (overlayViewport.height - overlayInset * 2) / 520,
+      1,
+    ),
+    0.48,
+    1,
+  );
+  const selectorGap = clampNumber(Math.round(overlayViewport.width * 0.024), 10, 32);
+  const weatherScale = clampNumber(Math.min(overlayViewport.width / 720, overlayViewport.height / 560), 0.68, 1);
+  const weatherBottom = overlayViewport.width < 760
+    ? overlayInset + SELECTOR_BASE_HEIGHT * selectorScale + 12
+    : overlayInset;
+  const weatherSize = WEATHER_ICON_BASE_SIZE * weatherScale;
+  const selectorTop = overlayViewport.height - overlayInset - SELECTOR_BASE_HEIGHT * selectorScale;
+  const topOverlayAvailableHeight = Math.max(
+    150,
+    Math.min(
+      overlayViewport.height - overlayInset - weatherBottom - weatherSize - 18,
+      selectorTop - overlayInset - 12,
+    ),
+  );
 
   // Notify parent which nation the selected sensor belongs to
   useEffect(() => {
@@ -2286,24 +2715,51 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     e.preventDefault();
     e.stopPropagation();
   };
-
-  const shouldRenderModal = isOpen || hasOpened;
+  const modalInitial = compactOrb
+    ? { opacity: 1, x: 0, y: 0, scale: 1 }
+    : entryTransition
+      ? {
+          opacity: 0,
+          x: entryTransition.x,
+          y: entryTransition.y,
+          scale: entryTransition.scale,
+        }
+      : { opacity: 0, x: 0, y: 0, scale: 1.04 };
+  const modalAnimate = compactOrb
+    ? { opacity: 1, x: 0, y: 0, scale: 1 }
+    : { opacity: 1, x: 0, y: 0, scale: 1 };
+  const modalExit = compactOrb
+    ? { opacity: 0, x: 0, y: 0, scale: 0.98 }
+    : entryTransition
+      ? {
+          opacity: 0,
+          x: entryTransition.x,
+          y: entryTransition.y,
+          scale: entryTransition.scale,
+        }
+      : { opacity: 0, x: 0, y: 0, scale: 0.98 };
 
   return (
     <AnimatePresence>
       {shouldRenderModal && (
         <motion.div
-          initial={{ opacity: 0, scale: 1.05 }}
-          animate={isOpen ? { opacity: 1, scale: 1 } : { opacity: 0, scale: 0.98 }}
-          exit={{ opacity: 0, scale: 0.98 }}
-          transition={{ duration: 0.6, ease: [0.16, 1, 0.3, 1] }}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-[#050505] overflow-hidden"
-          style={{ pointerEvents: isOpen ? 'auto' : 'none' }}
+          initial={modalInitial}
+          animate={isOpen ? modalAnimate : modalExit}
+          exit={modalExit}
+          transition={{ duration: compactOrb ? 0 : 0.72, ease: [0.16, 1, 0.3, 1] }}
+          className={`fixed inset-0 z-50 flex items-center justify-center overflow-hidden ${compactOrb ? 'bg-transparent' : 'bg-[#050505]'}`}
+          style={{
+            pointerEvents: compactOrb ? 'none' : isOpen ? 'auto' : 'none',
+            transformOrigin: 'center center',
+            willChange: compactOrb ? undefined : 'transform, opacity',
+          }}
           aria-hidden={!isOpen}
           onContextMenu={swallowContextMenu}
         >
           {/* Vignette */}
-          <div className="absolute inset-0 pointer-events-none opacity-50 bg-[radial-gradient(circle_at_center,_transparent_0%,_#000_100%)] z-10" />
+          {!compactOrb && (
+            <div className="absolute inset-0 pointer-events-none opacity-50 bg-[radial-gradient(circle_at_center,_transparent_0%,_#000_100%)] z-10" />
+          )}
 
           {/* Canvas */}
           <canvas
@@ -2312,24 +2768,66 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
             onContextMenu={handleContextMenu}
           />
 
-          <SegmentLeaderboardOverlay
-            items={segmentLeaderboard}
-            zoom={zoomLevel}
-            visible={viewMode === 'segment'}
-          />
+          <AnimatePresence>
+            {!compactOrb && (
+              <motion.div
+                key="network-sphere-context-overlays"
+                className="pointer-events-none absolute inset-0 z-[29]"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
+              >
+                <SegmentLeaderboardOverlay
+                  items={segmentLeaderboard}
+                  zoom={zoomLevel}
+                  visible={viewMode === 'segment'}
+                  viewport={overlayViewport}
+                  inset={overlayInset}
+                  maxHeight={topOverlayAvailableHeight}
+                />
 
-          <NetworkRelationStripOverlay
-            data={networkStripData}
-            zoom={zoomLevel}
-            visible={viewMode === 'congestion'}
-            onSensorClick={handleNetworkStripSensorClick}
-          />
+                <NetworkRelationStripOverlay
+                  data={networkStripData}
+                  zoom={zoomLevel}
+                  visible={viewMode === 'congestion'}
+                  onSensorClick={handleNetworkStripSensorClick}
+                  viewport={overlayViewport}
+                  inset={overlayInset}
+                  maxHeight={topOverlayAvailableHeight}
+                />
 
-          <WeatherStatusOverlay
-            condition={weatherCondition}
-          />
+                <WeatherStatusOverlay
+                  condition={weatherCondition}
+                  inset={overlayInset}
+                  bottom={weatherBottom}
+                  scale={weatherScale}
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
 
-          <div className="absolute right-6 bottom-6 z-[28] pointer-events-auto flex items-center gap-8">
+          <AnimatePresence>
+            {!compactOrb && (
+              <motion.div
+                key="network-sphere-controls"
+                className="pointer-events-none absolute inset-0 z-[28]"
+                initial={{ opacity: 0, y: 10, scale: 0.985 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 10, scale: 0.985 }}
+                transition={{ duration: 0.34, ease: [0.22, 1, 0.36, 1] }}
+              >
+          <div
+            data-star-overlay="selector"
+            className="absolute z-[28] pointer-events-auto flex items-center"
+            style={{
+              right: overlayInset,
+              bottom: overlayInset,
+              gap: selectorGap,
+              transform: `scale(${selectorScale})`,
+              transformOrigin: 'bottom right',
+            }}
+          >
             <div
               ref={sensorSliderRef}
               onMouseDown={handleSensorContainerMouseDown}
@@ -2471,7 +2969,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
 
               <div
                 ref={dateScrollRef}
-                className="absolute z-[3] w-[40px] h-[120px] overflow-y-scroll cursor-grab"
+                className="date-widget-scrollbar absolute z-[3] h-[120px] w-[40px] overflow-y-scroll cursor-grab"
                 style={{
                   left: '160px',
                   top: '100px',
@@ -2480,8 +2978,6 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
                   msOverflowStyle: 'none',
                   scrollSnapType: 'y mandatory',
                   scrollBehavior: 'smooth',
-                  scrollPaddingTop: DAY_WIDGET_CENTER_PADDING,
-                  scrollPaddingBottom: DAY_WIDGET_CENTER_PADDING,
                   WebkitOverflowScrolling: 'touch',
                   opacity: shouldHideDateWidget ? 0 : 1,
                   pointerEvents: shouldHideDateWidget || timeAnimating ? 'none' : 'auto',
@@ -2494,8 +2990,13 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
                     key={`tw-day-${d}`}
                     data-day-item="1"
                     data-day-value={d}
-                    className="flex items-center justify-center text-black text-[18px] font-bold"
-                    style={{ height: DAY_WIDGET_ITEM_HEIGHT, scrollSnapAlign: 'center', scrollSnapStop: 'always' }}
+                    className="flex items-center justify-center text-[18px] font-bold text-black"
+                    style={{
+                      height: DAY_WIDGET_ITEM_HEIGHT,
+                      scrollSnapAlign: 'center',
+                      scrollSnapStop: 'always',
+                      transformOrigin: 'center center',
+                    }}
                   >
                     {d}
                   </div>
@@ -2506,6 +3007,9 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
           </div>
 
           <ModeSwitchOverlay mode={viewMode} zoom={zoomLevel} />
+              </motion.div>
+            )}
+          </AnimatePresence>
         </motion.div>
       )}
     </AnimatePresence>
@@ -2545,12 +3049,24 @@ type NetworkStripData = {
 
 const WeatherStatusOverlay: React.FC<{
   condition?: string;
-}> = ({ condition }) => {
+  inset: number;
+  bottom: number;
+  scale: number;
+}> = ({ condition, inset, bottom, scale }) => {
   const Icon = getWeatherIcon(condition);
   const accent = getWeatherAccent(condition);
 
   return (
-    <div className="pointer-events-none absolute bottom-7 left-7 z-[29] text-white">
+    <div
+      data-star-overlay="weather"
+      className="pointer-events-none absolute z-[29] text-white"
+      style={{
+        left: inset,
+        bottom,
+        transform: `scale(${scale})`,
+        transformOrigin: 'bottom left',
+      }}
+    >
       <div
         className="flex h-[76px] w-[76px] items-center justify-center rounded-full border border-white/12 bg-black/34 backdrop-blur-xl"
         style={{ boxShadow: `0 0 44px ${accent}33, inset 0 0 22px rgba(255,255,255,0.06)` }}
@@ -2574,7 +3090,10 @@ const NetworkRelationStripOverlay: React.FC<{
   zoom: number;
   visible: boolean;
   onSensorClick?: (sensorIdx: number) => void;
-}> = ({ data, zoom, visible, onSensorClick }) => {
+  viewport: OverlayViewport;
+  inset: number;
+  maxHeight: number;
+}> = ({ data, zoom, visible, onSensorClick, viewport, inset, maxHeight }) => {
   const cameraDistance = MAX_CAMERA_DISTANCE - zoom * (MAX_CAMERA_DISTANCE - MIN_CAMERA_DISTANCE);
   const zoomOpacity = Math.max(0, Math.min(1, (cameraDistance - 4.5) / 2.0)) * 0.9;
   const opacity = visible && data ? zoomOpacity : 0;
@@ -2583,14 +3102,31 @@ const NetworkRelationStripOverlay: React.FC<{
   const hiddenAfter = data ? Math.max(0, data.total - data.end) : 0;
   const currentScore = data?.visible.find((item) => item.isCurrent)?.score;
   const currentPercent = Number.isFinite(currentScore) ? Math.round(Number(currentScore) * 100) : null;
+  const compact = viewport.width < 720;
+  const gap = compact ? 12 : 20;
+  const barWidth = compact ? 32 : 38;
+  const detailWidth = compact
+    ? clampNumber(viewport.width - inset * 2 - barWidth - gap, 132, 220)
+    : 230;
+  const barHeight = clampNumber(Math.min(maxHeight, viewport.height * 0.6, 560), 150, 560);
+  const routeFontSize = compact
+    ? `clamp(28px, ${Math.max(6, Math.min(9, viewport.width / 58)).toFixed(2)}vw, 44px)`
+    : 'clamp(38px, 5vw, 70px)';
+  const metaFontSize = compact ? 11 : 13;
 
   return (
     <motion.aside
-      className="absolute left-6 top-6 z-[29] text-white"
+      data-star-overlay="network-strip"
+      className="absolute z-[29] text-white"
       initial={false}
       animate={{ opacity, y: visible ? 0 : -10 }}
       transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-      style={{ pointerEvents: interactive ? 'auto' : 'none' }}
+      style={{
+        left: inset,
+        top: inset,
+        maxWidth: viewport.width - inset * 2,
+        pointerEvents: interactive ? 'auto' : 'none',
+      }}
       onWheel={(event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -2599,10 +3135,14 @@ const NetworkRelationStripOverlay: React.FC<{
       onTouchMove={(event) => event.stopPropagation()}
       aria-hidden={opacity <= 0.01}
     >
-      <div className="flex items-start gap-5">
+      <div className="flex items-start" style={{ gap }}>
         <div
-          className="flex h-[min(60vh,560px)] w-[38px] flex-col rounded-[2px] bg-white/[0.03] p-[3px] shadow-[0_24px_80px_rgba(0,0,0,0.42)] ring-1 ring-white/10 backdrop-blur-md"
+          className="flex flex-col rounded-[2px] bg-white/[0.03] p-[3px] shadow-[0_24px_80px_rgba(0,0,0,0.42)] ring-1 ring-white/10 backdrop-blur-md"
           onPointerDown={(event) => event.stopPropagation()}
+          style={{
+            width: barWidth,
+            height: barHeight,
+          }}
         >
           {hiddenBefore > 0 && (
             <div className="mb-1 flex h-5 shrink-0 items-center justify-center text-[9px] font-black tabular-nums text-white/38">
@@ -2654,23 +3194,32 @@ const NetworkRelationStripOverlay: React.FC<{
           )}
         </div>
 
-        <div className="mt-[-2px] w-[230px] select-none pointer-events-none">
+        <div
+          className="mt-[-2px] select-none pointer-events-none"
+          style={{ width: detailWidth }}
+        >
           {data && (
             <>
-              <div className="text-[clamp(38px,5vw,70px)] font-black leading-[0.82] tracking-[-0.075em] text-white drop-shadow-[0_14px_38px_rgba(255,255,255,0.18)]">
+              <div
+                className="font-black leading-[0.86] tracking-[-0.075em] text-white drop-shadow-[0_14px_38px_rgba(255,255,255,0.18)]"
+                style={{ fontSize: routeFontSize }}
+              >
                 {data.freeway} {data.direction}
               </div>
-              <div className="mt-3 flex items-baseline gap-4 font-mono tabular-nums">
-                <div className="text-[28px] font-black leading-none text-white/88">
+              <div className="mt-3 flex flex-wrap items-baseline gap-x-4 gap-y-1 font-mono tabular-nums">
+                <div className={`${compact ? 'text-[22px]' : 'text-[28px]'} font-black leading-none text-white/88`}>
                   {data.position}<span className="text-white/32">/{data.total}</span>
                 </div>
                 {currentPercent !== null && (
-                  <div className="text-[34px] font-black leading-none text-white">
+                  <div className={`${compact ? 'text-[26px]' : 'text-[34px]'} font-black leading-none text-white`}>
                     {currentPercent}%
                   </div>
                 )}
               </div>
-              <div className="mt-4 max-w-[220px] truncate text-[13px] font-black uppercase tracking-[0.14em] text-white/45">
+              <div
+                className="mt-4 truncate font-black uppercase tracking-[0.14em] text-white/45"
+                style={{ maxWidth: detailWidth, fontSize: metaFontSize }}
+              >
                 #{data.focusSensor + 1} · {data.currentName}
               </div>
             </>
@@ -2685,8 +3234,12 @@ const SegmentLeaderboardOverlay: React.FC<{
   items: SegmentLeaderboardItem[];
   zoom: number;
   visible: boolean;
-}> = ({ items, zoom, visible }) => {
-  const rowHeight = 58;
+  viewport: OverlayViewport;
+  inset: number;
+  maxHeight: number;
+}> = ({ items, zoom, visible, viewport, inset, maxHeight }) => {
+  const compact = viewport.width < 720;
+  const rowHeight = compact ? 46 : 58;
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const cameraDistance = MAX_CAMERA_DISTANCE - zoom * (MAX_CAMERA_DISTANCE - MIN_CAMERA_DISTANCE);
@@ -2694,6 +3247,12 @@ const SegmentLeaderboardOverlay: React.FC<{
   const opacity = visible ? zoomOpacity : 0;
   const interactive = opacity > 0.08;
   const headIndex = Math.min(items.length - 1, Math.max(0, Math.round(scrollTop / rowHeight)));
+  const panelWidth = compact
+    ? clampNumber(viewport.width - inset * 2, 260, 520)
+    : clampNumber(Math.min(520, viewport.width * 0.42), 320, 520);
+  const listMaxHeight = clampNumber(Math.min(maxHeight, viewport.height * 0.58, 560), 150, 560);
+  const titleGap = compact ? 12 : 16;
+  const titleMarginBottom = compact ? 12 : 20;
 
   const handleLeaderboardScroll = (event: React.UIEvent<HTMLDivElement>) => {
     setScrollTop(event.currentTarget.scrollTop);
@@ -2701,26 +3260,37 @@ const SegmentLeaderboardOverlay: React.FC<{
 
   return (
     <motion.aside
-      className="absolute left-6 top-6 z-[29] w-[min(520px,42vw)] max-w-[calc(100vw-3rem)] text-white"
+      data-star-overlay="leaderboard"
+      className="absolute z-[29] text-white"
       initial={false}
       animate={{ opacity, y: visible ? 0 : -10 }}
       transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-      style={{ pointerEvents: interactive ? 'auto' : 'none' }}
+      style={{
+        left: inset,
+        top: inset,
+        width: panelWidth,
+        pointerEvents: interactive ? 'auto' : 'none',
+      }}
       aria-hidden={!interactive}
     >
-      <div className="mb-5 flex items-end gap-4">
-        <div className="text-[10px] font-black uppercase tracking-[0.32em] text-white/35">Segment Load</div>
+      <div className="flex items-end" style={{ gap: titleGap, marginBottom: titleMarginBottom }}>
+        <div className={`${compact ? 'text-[9px]' : 'text-[10px]'} font-black uppercase tracking-[0.32em] text-white/35`}>Segment Load</div>
         <div className="h-px flex-1 bg-gradient-to-r from-white/25 to-transparent" />
       </div>
 
       <div
         ref={scrollRef}
-        className="max-h-[min(58vh,560px)] overflow-y-auto pr-5 [scrollbar-width:none] [-ms-overflow-style:none]"
+        className="overflow-y-auto [scrollbar-width:none] [-ms-overflow-style:none]"
         onScroll={handleLeaderboardScroll}
         onWheel={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
         onTouchMove={(event) => event.stopPropagation()}
-        style={{ WebkitOverflowScrolling: 'touch', scrollSnapType: 'y mandatory' }}
+        style={{
+          WebkitOverflowScrolling: 'touch',
+          scrollSnapType: 'y mandatory',
+          maxHeight: listMaxHeight,
+          paddingRight: compact ? 8 : 20,
+        }}
       >
         <div className="flex flex-col pb-6 [&::-webkit-scrollbar]:hidden">
           {items.map((item, index) => {
@@ -2734,9 +3304,13 @@ const SegmentLeaderboardOverlay: React.FC<{
               <button
                 key={item.nationIdx}
                 type="button"
-                className="group grid w-full grid-cols-[34px_minmax(0,1fr)_74px] items-baseline gap-4 text-left outline-none transition-[opacity,transform] duration-200 ease-out"
+                className="group grid w-full items-baseline text-left outline-none transition-[opacity,transform] duration-200 ease-out"
                 style={{
                   height: rowHeight,
+                  gridTemplateColumns: compact
+                    ? '26px minmax(0, 1fr) 58px'
+                    : '34px minmax(0, 1fr) 74px',
+                  gap: compact ? 10 : 16,
                   transform: `scale(${scale})`,
                   transformOrigin: 'left center',
                   opacity: rowOpacity,
@@ -2747,17 +3321,17 @@ const SegmentLeaderboardOverlay: React.FC<{
                 }}
               >
                 <span
-                  className={`text-[18px] font-black tabular-nums ${isTop ? 'text-white' : 'text-white/35'}`}
+                  className={`${compact ? 'text-[15px]' : 'text-[18px]'} font-black tabular-nums ${isTop ? 'text-white' : 'text-white/35'}`}
                 >
                   {index + 1}
                 </span>
                 <span
-                  className={`truncate text-[clamp(24px,3vw,42px)] font-black leading-[1.04] tracking-[-0.04em] transition-colors duration-200 group-hover:text-white ${isTop ? 'text-white drop-shadow-[0_8px_28px_rgba(255,255,255,0.18)]' : 'text-white/40'}`}
+                  className={`truncate ${compact ? 'text-[clamp(20px,7vw,30px)]' : 'text-[clamp(24px,3vw,42px)]'} font-black leading-[1.04] tracking-[-0.04em] transition-colors duration-200 group-hover:text-white ${isTop ? 'text-white drop-shadow-[0_8px_28px_rgba(255,255,255,0.18)]' : 'text-white/40'}`}
                 >
                   {item.label}
                 </span>
                 <span
-                  className={`text-right text-[22px] font-black tabular-nums ${isTop ? 'text-white' : 'text-white/40'}`}
+                  className={`text-right ${compact ? 'text-[18px]' : 'text-[22px]'} font-black tabular-nums ${isTop ? 'text-white' : 'text-white/40'}`}
                 >
                   {item.percent}%
                 </span>

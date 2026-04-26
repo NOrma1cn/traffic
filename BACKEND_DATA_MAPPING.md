@@ -93,7 +93,8 @@
 | `current.components.*` | `_risk_from_state(...)` | 风险分量 |
 | `prediction_windows.h1/h6/h12` | `pred` + `_window_packet(...)` | 关键预测窗口摘要 |
 | `prediction_series.*` | `pred[sensor, :, :]` | 逐步预测序列 |
-| `history_tail.*` | 真实交通张量 | 过去 24 个点 |
+| `history_tail.*` | 真实交通张量 | 默认过去 48 个点，可用 `history_steps` / `history_tail_steps` 调整 |
+| `daily_congestion.*` | 真实交通张量 + `_risk_from_state(...)` | 当前自然日 24 个小时均值拥堵点，未来小时为 `none` |
 | `weekly_compare.days[].*` | 真实交通张量 | 最近 7 天相同时段窗口 |
 | `profiles.metrics.*` | `self.profiles` | 当前时段历史分位对照 |
 | `global_state.pred_scores` | `_risk_from_arrays(...)` | 全图未来风险峰值 |

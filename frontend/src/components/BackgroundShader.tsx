@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 export type SunnyDayPhase = 'sunrise' | 'noon' | 'sunset' | 'midnight';
 
@@ -11,6 +11,9 @@ interface BackgroundShaderProps {
   isActive?: boolean;
   onFpsUpdate?: (fps: number) => void;
 }
+
+const WEATHER_BLACKOUT_FADE_MS = 420;
+const WEATHER_BLACKOUT_HOLD_MS = 90;
 
 function getBackgroundRenderScale(weatherCondition: BackgroundShaderProps['weatherCondition']) {
   if (weatherCondition === 'Cloudy') return 0.46;
@@ -633,8 +636,17 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
   onFpsUpdate,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [renderedWeatherCondition, setRenderedWeatherCondition] = useState(weatherCondition);
+  const [isWeatherBlackoutVisible, setIsWeatherBlackoutVisible] = useState(false);
   const propsRef = useRef({ precipitation, dayPhase, sunIntensity, ledMode });
   const fpsUpdateRef = useRef(onFpsUpdate);
+  const renderedWeatherConditionRef = useRef(weatherCondition);
+  const weatherFadeTimersRef = useRef<number[]>([]);
+
+  const clearWeatherFadeTimers = () => {
+    weatherFadeTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    weatherFadeTimersRef.current = [];
+  };
 
   useEffect(() => {
     propsRef.current = { precipitation, dayPhase, sunIntensity, ledMode };
@@ -643,6 +655,33 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
   useEffect(() => {
     fpsUpdateRef.current = onFpsUpdate;
   }, [onFpsUpdate]);
+
+  useEffect(() => {
+    if (weatherCondition === renderedWeatherConditionRef.current) {
+      setIsWeatherBlackoutVisible(false);
+      return;
+    }
+
+    clearWeatherFadeTimers();
+    setIsWeatherBlackoutVisible(true);
+
+    const swapTimer = window.setTimeout(() => {
+      renderedWeatherConditionRef.current = weatherCondition;
+      setRenderedWeatherCondition(weatherCondition);
+
+      const revealTimer = window.setTimeout(() => {
+        setIsWeatherBlackoutVisible(false);
+      }, WEATHER_BLACKOUT_HOLD_MS);
+
+      weatherFadeTimersRef.current = [revealTimer];
+    }, WEATHER_BLACKOUT_FADE_MS);
+
+    weatherFadeTimersRef.current = [swapTimer];
+
+    return clearWeatherFadeTimers;
+  }, [weatherCondition]);
+
+  useEffect(() => clearWeatherFadeTimers, []);
 
   useEffect(() => {
     if (isActive) return;
@@ -664,7 +703,7 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
 
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const renderScale = getBackgroundRenderScale(weatherCondition);
+    const renderScale = getBackgroundRenderScale(renderedWeatherCondition);
     const gl =
       (canvas.getContext('webgl') as WebGLRenderingContext | null) ||
       (canvas.getContext('experimental-webgl') as WebGLRenderingContext | null);
@@ -689,9 +728,9 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
 
     const vertexShader = compileShader(gl as WebGLRenderingContext, vertexShaderSource, gl.VERTEX_SHADER);
     let fragmentShaderSource;
-    if (weatherCondition === 'Rainy') {
+    if (renderedWeatherCondition === 'Rainy') {
         fragmentShaderSource = rainyFragmentShaderSource;
-    } else if (weatherCondition === 'Cloudy') {
+    } else if (renderedWeatherCondition === 'Cloudy') {
         fragmentShaderSource = cloudyFragmentShaderSource;
     } else {
         fragmentShaderSource = sunnyFragmentShaderSource;
@@ -734,8 +773,9 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
     const transitionLocation = gl.getUniformLocation(program, 'u_transition');
 
     const resize = () => {
-      canvas.width = Math.max(1, Math.round(window.innerWidth * renderScale));
-      canvas.height = Math.max(1, Math.round(window.innerHeight * renderScale));
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.round(rect.width * renderScale));
+      canvas.height = Math.max(1, Math.round(rect.height * renderScale));
       gl.viewport(0, 0, canvas.width, canvas.height);
     };
     window.addEventListener('resize', resize);
@@ -790,7 +830,7 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
       cancelAnimationFrame(animationFrameId);
       fpsUpdateRef.current?.(0);
     };
-  }, [weatherCondition, isActive]);
+  }, [renderedWeatherCondition, isActive]);
 
   return (
     <div className="absolute inset-0 z-0 overflow-hidden pointer-events-none bg-[#0A0A0B]">
@@ -807,6 +847,14 @@ const BackgroundShader: React.FC<BackgroundShaderProps> = ({
       <canvas
         ref={canvasRef}
         className="absolute inset-0 z-10 w-full h-full block"
+      />
+      <div
+        className="absolute inset-0 z-20 bg-[#030305]"
+        style={{
+          opacity: isWeatherBlackoutVisible ? 1 : 0,
+          transition: `opacity ${WEATHER_BLACKOUT_FADE_MS}ms cubic-bezier(0.4, 0, 0.2, 1)`,
+          willChange: 'opacity',
+        }}
       />
     </div>
   );

@@ -27,6 +27,8 @@ export type IncidentEvent = {
   debug_start_in_minutes?: number | null;
   debug_start_time?: string | null;
   debug_end_time?: string | null;
+  incident_datetime?: string | null;
+  end_datetime?: string | null;
 };
 
 export type IncidentContext = {

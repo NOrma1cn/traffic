@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&family=Orbitron:wght@400;700;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&family=Orbitron:wght@400;700;900&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -32,6 +32,10 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #3F3F46;
+}
+
+.date-widget-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
 /* Rain Shader Keyframes */

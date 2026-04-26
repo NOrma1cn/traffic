@@ -47,6 +47,9 @@ WEATHER_FIELDS = [
     "sealevelpressure",
 ]
 TARGET_NAMES = ["flow", "occupancy", "speed"]
+DEFAULT_CHART_HISTORY_STEPS = 48
+MIN_CHART_HISTORY_STEPS = 12
+MAX_CHART_HISTORY_STEPS = 144
 
 
 def _idx_to_hhmm(idx: int) -> str:
@@ -192,6 +195,13 @@ def parse_t_obs_query(value) -> int | None:
     if parsed is None:
         return None
     return int(parsed)
+
+
+def parse_history_steps_query(value) -> int | None:
+    parsed = _maybe_int(value)
+    if parsed is None:
+        return None
+    return max(MIN_CHART_HISTORY_STEPS, min(MAX_CHART_HISTORY_STEPS, int(parsed)))
 
 
 def parse_weather_override_query(qs: dict[str, list[str]]) -> dict[str, float]:
@@ -1746,6 +1756,7 @@ class CaltransTrafficService:
         sensor: int,
         t_obs_override: int | None = None,
         weather_override: dict[str, float] | None = None,
+        history_steps: int | None = None,
     ) -> dict:
         if not (0 <= sensor < self.n_nodes):
             raise ValueError(f"sensor must be in [0, {self.n_nodes - 1}]")
@@ -1866,7 +1877,8 @@ class CaltransTrafficService:
         # scenario_predictions already built above
         # incident_scenarios already built above
 
-        tail_len = 24
+        tail_len = history_steps if history_steps is not None else DEFAULT_CHART_HISTORY_STEPS
+        tail_len = max(MIN_CHART_HISTORY_STEPS, min(MAX_CHART_HISTORY_STEPS, int(tail_len)))
         hist_idx = self._circular_indices(t_obs - tail_len + 1, tail_len)
         history_tail = {
             "times": [_idx_to_hhmm(i) for i in hist_idx],
@@ -2028,6 +2040,53 @@ class CaltransTrafficService:
         accident_context = self._accident_context_packet(t_obs, sensor)
         local_network = self._local_network_packet(sensor, t_obs)
         profile_context = self._metric_profile_packet(sensor, t_obs, current_packet)
+        day_start_idx = int(t_obs) - (int(t_obs) % 288)
+        current_day_slot = int(t_obs) % 288
+        current_hour = current_day_slot // 12
+        day_scores: list[float | None] = []
+        day_levels: list[str] = []
+        day_times: list[str] = []
+        for hour in range(24):
+            hour_start_slot = hour * 12
+            hour_end_slot = hour_start_slot + 11
+            day_times.append(f"{hour:02d}:00")
+
+            if hour_start_slot > current_day_slot:
+                day_scores.append(None)
+                day_levels.append("none")
+                continue
+
+            last_slot = min(hour_end_slot, current_day_slot)
+            hour_idx = self._circular_indices(day_start_idx + hour_start_slot, last_slot - hour_start_slot + 1)
+            hourly_scores = []
+            for idx in hour_idx:
+                hour_risk = self._risk_from_state(
+                    sensor=sensor,
+                    idx=int(idx),
+                    flow=float(self.flow_raw[idx, sensor]),
+                    occupancy=float(self.occupancy_raw[idx, sensor]),
+                    speed=float(self.speed_raw[idx, sensor]),
+                )
+                hourly_scores.append(float(hour_risk["score"]))
+
+            avg_score = float(np.mean(hourly_scores)) if hourly_scores else 0.0
+            day_scores.append(_round(avg_score, 3))
+            if avg_score >= 0.8:
+                day_levels.append("severe")
+            elif avg_score >= 0.6:
+                day_levels.append("high")
+            elif avg_score >= 0.35:
+                day_levels.append("medium")
+            else:
+                day_levels.append("low")
+
+        daily_congestion = {
+            "times": day_times,
+            "risk_score": day_scores,
+            "risk_level": day_levels,
+            "current_hour": int(current_hour),
+            "hour_count": 24,
+        }
 
         final_out = {
             "meta": {
@@ -2045,6 +2104,8 @@ class CaltransTrafficService:
                 "slot_index": int(self._slot_index(t_obs)),
                 "counterfactual_weather": bool(base_weather_override),
                 "weather_override_fields": sorted(list((base_weather_override or {}).keys())),
+                "history_tail_steps": int(tail_len),
+                "history_tail_minutes": int(tail_len * 5),
             },
             "dataset_context": self._dataset_context_packet(),
             "station": station_packet,
@@ -2063,6 +2124,7 @@ class CaltransTrafficService:
             "prediction_windows": windows,
             "prediction_series": prediction_series,
             "history_tail": history_tail,
+            "daily_congestion": daily_congestion,
             "weekly_compare": weekly_compare,
             "confidence": confidence,
             "scenario_predictions": scenario_predictions,
@@ -2204,6 +2266,9 @@ class Handler(BaseHTTPRequestHandler):
                 q = parse_qs(u.query)
                 sensor = int(q.get("sensor", ["0"])[0])
                 t_obs = parse_t_obs_query(q.get("t_obs", [None])[0])
+                history_steps = parse_history_steps_query(
+                    q.get("history_steps", q.get("history_tail_steps", [None]))[0]
+                )
                 weather_override = parse_weather_override_query(q)
                 weather_preset = str(q.get("weather_preset", [""])[0]).strip()
                 if weather_preset:
@@ -2219,6 +2284,7 @@ class Handler(BaseHTTPRequestHandler):
                         sensor=sensor,
                         t_obs_override=t_obs,
                         weather_override=weather_override or None,
+                        history_steps=history_steps,
                     ),
                 )
                 return

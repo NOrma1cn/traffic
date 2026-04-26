@@ -1,6 +1,5 @@
 import React, { useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Route } from 'lucide-react';
 import type { IncidentContext, IncidentEvent } from './IncidentStatusPanel';
 
 interface ForecastChartPoint {
@@ -20,10 +19,16 @@ interface ForecastChartProps {
   compact?: boolean;
   simTime?: string;
   forcedMax?: number;
+  dailyCongestion?: {
+    times: string[];
+    risk_score: Array<number | null>;
+    risk_level: Array<'low' | 'medium' | 'high' | 'severe' | 'none'>;
+    current_hour: number;
+    hour_count: number;
+  };
   branchPredicted?: number[];
   branchLabel?: string;
   accidents?: IncidentContext | null;
-  onOpenNetworkSphere?: () => void;
 }
 
 type IncidentTheme = {
@@ -48,6 +53,15 @@ type ChartIncidentZone = {
   endLabel: string;
   durationLabel: string;
   blocks: Array<{ dur: string; del: string; maxOp: string }>;
+};
+
+type DayTraceSegment = {
+  key: string;
+  level: 'low' | 'medium' | 'high' | 'severe' | 'none';
+  hours: number;
+  avgScore: number | null;
+  startHour: number;
+  endHour: number;
 };
 
 const incidentThemeMap: Record<string, IncidentTheme> = {
@@ -134,6 +148,21 @@ const getIncidentTheme = (event: IncidentEvent): IncidentTheme => {
   return incidentThemeMap[category] ?? incidentThemeMap.other;
 };
 
+const getCongestionColor = (level?: 'low' | 'medium' | 'high' | 'severe' | 'none') => {
+  switch (level) {
+    case 'severe':
+      return '#ef4444';
+    case 'high':
+      return '#f97316';
+    case 'medium':
+      return '#ff9f0a';
+    case 'none':
+      return '#1c1c1e';
+    default:
+      return '#30d158';
+  }
+};
+
 const niceNumber = (range: number, round: boolean) => {
   if (!Number.isFinite(range) || range <= 0) return 1;
 
@@ -209,11 +238,70 @@ const getTickIndexes = (total: number, plotWidth: number) => {
   return Array.from(indexes).sort((a, b) => a - b);
 };
 
+const isWholeHour = (value: string) => {
+  const parsed = parseTimeMs(value);
+  if (parsed !== null) {
+    const date = new Date(parsed);
+    return date.getMinutes() === 0 && date.getSeconds() === 0;
+  }
+
+  const parts = value.split(' ');
+  const timePart = parts.length > 1 ? parts[1] : value;
+  const [hh, mm = '0'] = timePart.split(':');
+  return hh !== undefined && hh !== '' && Number(mm) === 0;
+};
+
+const getHourlyTickIndexes = (times: string[], plotWidth: number) => {
+  if (times.length <= 0) return [];
+  if (times.length === 1) return [0];
+
+  const hourlyIndexes = times
+    .map((time, idx) => (isWholeHour(time) ? idx : null))
+    .filter((idx): idx is number => idx !== null);
+
+  if (!hourlyIndexes.length) return getTickIndexes(times.length, plotWidth);
+
+  const targetTicks = clamp(Math.floor(plotWidth / 145) + 1, 3, 8);
+  if (hourlyIndexes.length <= targetTicks) return hourlyIndexes;
+
+  const selected = new Set<number>();
+  for (let i = 0; i < targetTicks; i++) {
+    const idx = Math.round((i / Math.max(targetTicks - 1, 1)) * (hourlyIndexes.length - 1));
+    selected.add(hourlyIndexes[idx]);
+  }
+
+  return Array.from(selected).sort((a, b) => a - b);
+};
+
+const formatHourLabel = (value: string) => {
+  const parsed = parseTimeMs(value);
+  const date = parsed === null ? null : new Date(parsed);
+  const rawHour = date === null
+    ? (() => {
+        const parts = value.split(' ');
+        const timePart = parts.length > 1 ? parts[1] : value;
+        return Number(timePart.split(':')[0]);
+      })()
+    : date.getHours();
+
+  if (!Number.isFinite(rawHour)) return null;
+
+  const hour = ((rawHour % 24) + 24) % 24;
+  const suffix = hour < 12 ? 'am' : 'pm';
+  const displayHour = hour % 12 === 0 ? 12 : hour % 12;
+  return `${displayHour}${suffix}`;
+};
+
 const formatXAxisLabel = (value: string, prevValue?: string) => {
   const parts = value.split(' ');
   const datePart = parts.length > 1 ? parts[0] : '';
   const timePart = parts.length > 1 ? parts[1] : value;
   const time = timePart.slice(0, 5);
+
+  if (isWholeHour(value)) {
+    const hourLabel = formatHourLabel(value);
+    if (hourLabel) return hourLabel;
+  }
 
   if (!prevValue) return time;
   const prevParts = prevValue.split(' ');
@@ -242,6 +330,35 @@ const formatChartDateTime = (value?: string) => {
   };
 };
 
+const formatHourMinuteFromDecimal = (hourValue: number) => {
+  const totalMinutes = Math.round(clamp(hourValue, 0, 24) * 60);
+  const hour = Math.min(24, Math.floor(totalMinutes / 60));
+  const minute = hour >= 24 ? 0 : totalMinutes % 60;
+  return `${String(hour).padStart(2, '0')}时${String(minute).padStart(2, '0')}分`;
+};
+
+const formatChineseDateTime = (value?: string) => {
+  const parsed = value ? parseTimeMs(value) : null;
+  if (parsed === null) return null;
+
+  const date = new Date(parsed);
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const hour = String(date.getHours()).padStart(2, '0');
+  const minute = String(date.getMinutes()).padStart(2, '0');
+  return {
+    date: `${month}月${day}日`,
+    time: `${hour}时${minute}分`,
+  };
+};
+
+const getDayProgressHours = (value?: string) => {
+  const parsed = value ? parseTimeMs(value) : null;
+  if (parsed === null) return null;
+  const date = new Date(parsed);
+  return clamp(date.getHours() + date.getMinutes() / 60 + date.getSeconds() / 3600, 0, 24);
+};
+
 /**
  * 生成平滑的 SVG 路径 (Simple Bezier approximation)
  */
@@ -262,15 +379,16 @@ const getSmoothPath = (points: { x: number; y: number }[]) => {
 const ForecastChart: React.FC<ForecastChartProps> = ({
   data,
   predictionStartIdx,
+  metricLabel,
   unit,
   syncX,
   onSyncX,
   compact = false,
   simTime,
   forcedMax,
+  dailyCongestion,
   branchPredicted,
   accidents,
-  onOpenNetworkSphere,
 }) => {
   const svgHostRef = React.useRef<HTMLDivElement | null>(null);
   const svgRef = React.useRef<SVGSVGElement | null>(null);
@@ -279,6 +397,7 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
   const readoutClipId = `fc-readout-clip-${uid}`;
   const [internalHoveredPoint, setInternalHoveredPoint] = useState<any>(null);
   const [hoveredIncidentId, setHoveredIncidentId] = useState<string | null>(null);
+  const [hoveredDaySegment, setHoveredDaySegment] = useState<DayTraceSegment | null>(null);
   const isPercentScale = unit.includes('%');
   const normalizeMetricValue = (value: number) => (isPercentScale ? clamp(value, 0, 100) : value);
 
@@ -434,8 +553,8 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
       width: measuredWidth,
       height: measuredHeight,
       padding: compact
-        ? { top: 48, bottom: 56, left: 76, right: 52 }
-        : { top: 64, bottom: 78, left: 100, right: 56 },
+        ? { top: 72, bottom: 70, left: 94, right: 52 }
+        : { top: 88, bottom: 96, left: 126, right: 56 },
       yTicks: pickTicks(
         scale.ticks.filter(tick => tick >= finalMin - scale.step * 0.1 && tick <= finalMax + scale.step * 0.1),
         compact ? 5 : 4,
@@ -451,14 +570,17 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
   const getX = (idx: number, total: number) => padding.left + (idx / Math.max(total - 1, 1)) * (width - padding.left - padding.right);
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
+  const dayTraceBarTop = padding.top - 4;
 
   const observedPathPoints = chartData.observed.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
   const predictedPathPoints = chartData.predicted.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
   const branchPathPoints = branchSeries.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
+  const simTimeLabel = useMemo(() => formatChineseDateTime(simTime), [simTime]);
+  const dayProgressHours = useMemo(() => getDayProgressHours(simTime), [simTime]);
 
   const xTickIndexes = useMemo(() => {
-    return getTickIndexes(data.length, plotWidth);
-  }, [data.length, plotWidth]);
+    return getHourlyTickIndexes(data.map((point) => point.time), plotWidth);
+  }, [data, plotWidth]);
 
   const hoverReadout = useMemo(() => {
     if (!hoveredPoint) return null;
@@ -484,8 +606,10 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
       const theme = getIncidentTheme(event);
       const severity = toFiniteNumber(event.severity) ?? 0.9;
       const futureStartMinutes = Math.max(0, toFiniteNumber(event.debug_start_in_minutes) ?? 0);
-      const absoluteStartMs = parseTimeMs(event.debug_start_time ?? '');
-      const absoluteEndMs = parseTimeMs(event.debug_end_time ?? '');
+      const absoluteStartTime = event.debug_start_time ?? event.incident_datetime ?? '';
+      const absoluteEndTime = event.debug_end_time ?? event.end_datetime ?? '';
+      const absoluteStartMs = parseTimeMs(absoluteStartTime);
+      const absoluteEndMs = parseTimeMs(absoluteEndTime);
       const hasAbsoluteWindow = absoluteStartMs !== null && absoluteEndMs !== null && absoluteEndMs > absoluteStartMs;
       const hasSimAnchoredWindow = hasAbsoluteWindow && baseSimTime !== null;
 
@@ -533,8 +657,8 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
       const title = event.event_type ?? theme.label;
       const startIdx = Math.max(0, Math.floor(startPos));
       const endIdx = Math.min(data.length - 1, Math.ceil(endPos));
-      const startLabel = hasAbsoluteWindow ? formatIncidentTime(event.debug_start_time ?? '') : formatIncidentTime(data[startIdx]?.time ?? '');
-      const endLabel = hasAbsoluteWindow ? formatIncidentTime(event.debug_end_time ?? '') : formatIncidentTime(data[endIdx]?.time ?? '');
+      const startLabel = hasAbsoluteWindow ? formatIncidentTime(absoluteStartTime) : formatIncidentTime(data[startIdx]?.time ?? '');
+      const endLabel = hasAbsoluteWindow ? formatIncidentTime(absoluteEndTime) : formatIncidentTime(data[endIdx]?.time ?? '');
       const derivedStart = baseSimTime === null
         ? null
         : new Date(baseSimTime + (futureStartMinutes > 0 ? futureStartMinutes : -elapsedMinutes) * 60000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
@@ -578,6 +702,74 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
     () => incidentZones.find((zone) => zone.id === hoveredIncidentId) ?? null,
     [incidentZones, hoveredIncidentId],
   );
+
+  const dayTrace = useMemo(() => {
+    if (!dailyCongestion?.risk_score?.length) return null;
+    const hourCount = Math.max(1, dailyCongestion.hour_count || dailyCongestion.risk_score.length || 24);
+    const elapsedHours = dayProgressHours ?? clamp((dailyCongestion.current_hour ?? 0) + 1, 0, hourCount);
+    const buckets = Array.from({ length: hourCount }, (_, idx) => ({
+      level: dailyCongestion.risk_level?.[idx] ?? 'none',
+      score: dailyCongestion.risk_score[idx],
+    }));
+    const segments: DayTraceSegment[] = [];
+
+    const appendSegment = (
+      level: 'low' | 'medium' | 'high' | 'severe' | 'none',
+      hours: number,
+      score: number | null,
+      startHour: number,
+      endHour: number,
+      keyHint: string,
+    ) => {
+      if (hours <= 0.001) return;
+      const previous = segments[segments.length - 1];
+      if (previous && previous.level === level) {
+        const previousTotal = previous.avgScore === null ? 0 : previous.avgScore * previous.hours;
+        previous.hours += hours;
+        previous.endHour = endHour;
+        previous.avgScore = score === null ? previous.avgScore : (previousTotal + score * hours) / previous.hours;
+        return;
+      }
+
+      segments.push({
+        key: `${level}-${keyHint}`,
+        level,
+        hours,
+        avgScore: score,
+        startHour,
+        endHour,
+      });
+    };
+
+    buckets.forEach((bucket, idx) => {
+      const score = Number.isFinite(bucket.score) ? Number(bucket.score) : null;
+      const hourStart = idx;
+      const hourEnd = idx + 1;
+      const level = bucket.level === 'none' ? 'none' : bucket.level;
+
+      if (elapsedHours >= hourEnd) {
+        appendSegment(level, 1, score, hourStart, hourEnd, String(idx));
+        return;
+      }
+
+      if (elapsedHours > hourStart) {
+        appendSegment(level, elapsedHours - hourStart, score, hourStart, elapsedHours, `${idx}-active`);
+        appendSegment('none', hourEnd - elapsedHours, null, elapsedHours, hourEnd, `${idx}-future`);
+        return;
+      }
+
+      appendSegment('none', 1, null, hourStart, hourEnd, String(idx));
+    });
+
+    return { segments };
+  }, [dailyCongestion, dayProgressHours]);
+
+  const dayTraceReadout = hoveredDaySegment
+    ? {
+        date: `${formatHourMinuteFromDecimal(hoveredDaySegment.startHour)} - ${formatHourMinuteFromDecimal(hoveredDaySegment.endHour)}`,
+        time: hoveredDaySegment.avgScore === null ? '无数据' : `平均拥堵 ${Math.round(hoveredDaySegment.avgScore * 100)}%`,
+      }
+    : simTimeLabel;
 
   React.useEffect(() => {
     if (!incidentZones.some((zone) => zone.id === hoveredIncidentId)) {
@@ -665,24 +857,21 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
         }
       `}</style>
 
-      <div ref={svgHostRef} className={`${compact ? 'h-[360px]' : 'h-[520px]'} relative w-full overflow-hidden`}>
-        {onOpenNetworkSphere && (
-          <button
-            type="button"
-            onClick={onOpenNetworkSphere}
-            className="pointer-events-auto absolute z-20 inline-flex h-14 items-center gap-3 rounded-[18px] border border-cyan-300/20 bg-black/45 px-5 text-left text-white shadow-[0_14px_50px_rgba(0,0,0,0.35)] backdrop-blur-xl transition hover:border-cyan-300/45 hover:bg-cyan-500/12 active:scale-[0.98]"
-            aria-label="打开路网星图"
-            style={{ left: Math.max(12, padding.left - 6), top: Math.max(0, padding.top - 16), transform: 'translateY(-100%)' }}
-          >
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-cyan-300/25 bg-cyan-400/10 text-cyan-200">
-              <Route size={18} />
-            </div>
-            <div className="flex flex-col">
-              <span className="text-[10px] font-black uppercase tracking-[0.22em] text-cyan-200/55">Road Network</span>
-              <span className="text-sm font-black tracking-[0.08em] text-white/92">打开路网星图</span>
-            </div>
-          </button>
-        )}
+      <div ref={svgHostRef} className={`${compact ? 'h-[420px]' : 'h-[600px]'} relative w-full overflow-hidden`}>
+        <div
+          className="pointer-events-none absolute z-30 max-w-[46%] truncate font-black uppercase text-white/88 drop-shadow-[0_0_24px_rgba(255,255,255,0.14)]"
+          style={{
+            left: padding.left,
+            top: dayTraceBarTop,
+            transform: 'translateY(-100%)',
+            fontFamily: '"Arial Rounded MT Bold", "Nunito", "Segoe UI", system-ui, sans-serif',
+            fontSize: compact ? 36 : 56,
+            letterSpacing: 0,
+            lineHeight: 0.92,
+          }}
+        >
+          {metricLabel}
+        </div>
 
         {hoveredIncident && (
           <div
@@ -723,6 +912,54 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
           </div>
         )}
 
+        {dayTrace && (
+          <div
+            className="pointer-events-auto absolute z-20"
+            style={{
+              left: padding.left,
+              right: padding.right,
+              top: dayTraceBarTop,
+            }}
+          >
+            {dayTraceReadout && (
+              <div
+                className="pointer-events-none absolute right-0 text-right uppercase"
+                style={{
+                  bottom: compact ? 18 : 20,
+                  fontFamily: '"Arial Rounded MT Bold", "Nunito", "Segoe UI", system-ui, sans-serif',
+                }}
+              >
+                <div className={`${compact ? 'text-[14px]' : 'text-[18px]'} font-black text-white/56 drop-shadow-[0_0_14px_rgba(255,255,255,0.12)]`}>
+                  {dayTraceReadout.date}
+                </div>
+                <div className={`${compact ? 'text-[34px]' : 'text-[52px]'} mt-1 font-black leading-[0.9] text-white/92 drop-shadow-[0_0_28px_rgba(255,255,255,0.16)]`}>
+                  {dayTraceReadout.time}
+                </div>
+              </div>
+            )}
+            <div className="flex h-[10px] w-full gap-[2px]" onMouseLeave={() => setHoveredDaySegment(null)}>
+              {dayTrace.segments.map((segment) => (
+                <div
+                  key={segment.key}
+                  className="h-full cursor-crosshair transition duration-200 ease-out hover:scale-y-150 hover:brightness-125"
+                  style={{
+                    flex: segment.hours,
+                    backgroundColor: getCongestionColor(segment.level),
+                    boxShadow: segment.level === 'none'
+                      ? undefined
+                      : `0 0 6px ${getCongestionColor(segment.level)}26`,
+                    opacity: segment.level === 'none'
+                      ? 1
+                      : 0.78 + clamp(segment.avgScore ?? 0, 0, 1) * 0.22,
+                    transformOrigin: 'center',
+                  }}
+                  onMouseEnter={() => setHoveredDaySegment(segment)}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
         <svg ref={svgRef} viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="xMinYMin meet" className="w-full h-full overflow-visible">
           <defs>
             <linearGradient id="glowGradient" x1="0" y1="0" x2="0" y2="1">
@@ -758,10 +995,10 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
                   y={y}
                   fill="currentColor"
                   className={isMajor
-                    ? 'text-zinc-50 font-mono text-[26px] font-black'
+                    ? 'text-zinc-50 font-mono text-[40px] font-black'
                     : isMid
-                      ? 'text-zinc-200 font-mono text-[18px] font-black'
-                    : 'text-zinc-300 font-mono text-[15px] font-bold'
+                      ? 'text-zinc-200 font-mono text-[30px] font-black'
+                    : 'text-zinc-300 font-mono text-[24px] font-black'
                   }
                   textAnchor="end" dominantBaseline="middle"
                 >
@@ -800,8 +1037,8 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
                   x={x} y={height - padding.bottom + 38}
                   fill="currentColor"
                   className={isMajor
-                    ? 'text-zinc-200 font-mono text-[17px] font-black uppercase tracking-wider'
-                    : 'text-zinc-400 font-mono text-[14px] font-bold uppercase tracking-wider'
+                    ? 'text-zinc-200 font-mono text-[28px] font-black uppercase'
+                    : 'text-zinc-400 font-mono text-[22px] font-black uppercase'
                   }
                   textAnchor="middle"
                 >
