@@ -570,7 +570,8 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
   const getX = (idx: number, total: number) => padding.left + (idx / Math.max(total - 1, 1)) * (width - padding.left - padding.right);
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
-  const dayTraceBarTop = padding.top - 4;
+  const dayTraceBarHeight = 10;
+  const dayTraceBarTop = padding.top - dayTraceBarHeight;
 
   const observedPathPoints = chartData.observed.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
   const predictedPathPoints = chartData.predicted.map(p => ({ x: getX(p.x, data.length), y: getY(p.y) }));
@@ -857,7 +858,7 @@ const ForecastChart: React.FC<ForecastChartProps> = ({
         }
       `}</style>
 
-      <div ref={svgHostRef} className={`${compact ? 'h-[420px]' : 'h-[600px]'} relative w-full overflow-hidden`}>
+      <div ref={svgHostRef} className={`${compact ? 'h-[420px]' : 'h-[600px]'} relative w-full overflow-visible`}>
         <div
           className="pointer-events-none absolute z-30 max-w-[46%] truncate font-black uppercase text-white/88 drop-shadow-[0_0_24px_rgba(255,255,255,0.14)]"
           style={{

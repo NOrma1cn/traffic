@@ -23,7 +23,6 @@
 | `/api/forecast` | `profiles` | `self.profiles` | 当前时段历史分位统计 |
 | `/api/forecast` | `scenario_predictions` | 天气情景 override 批推理 | 天气扰动情景预测 |
 | `/api/forecast` | `incident_scenarios` | 事故情景 override 批推理 | 事故持续情景预测 |
-| `/api/forecast` | `confidence` | 风险分量 + 走势一致性 | 预测置信度解释 |
 | `/api/forecast` | `congestion_summary` | 当前/未来窗口风险 | 最高风险窗口摘要 |
 | `/api/forecast` | `global_state` | 全图未来风险数组 | 所有节点未来风险峰值 |
 | `/api/forecast` | `model_context` | checkpoint/config | 模型结构与输入上下文 |
@@ -151,7 +150,7 @@
 | 天气原始参数面板 | `weather_context.current.raw_fields` |
 | 天气时间轴 | `weather_context.recent_history`, `weather_context.forecast_window` |
 | 事故详情面板 | `accidents.current`, `accidents.history`, `accidents.active_features` |
-| 当前异常解释 | `profiles`, `current.components`, `confidence` |
+| 当前异常解释 | `profiles`, `current.components`, `congestion_summary` |
 | 周时段对比图 | `weekly_compare` |
 | 全局数据集说明 | `/api/dataset_context` |
 

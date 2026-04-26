@@ -31,6 +31,11 @@ from traffic_ew.graph import build_adjacency_from_edges, normalize_adjacency
 from traffic_ew.model import create_model
 from traffic_ew.static_features import build_static_features
 from traffic_ew.correction_model import WeatherCorrectionNet
+from traffic_ew.congestion import (
+    calculate_congestion_degree,
+    congestion_level_from_score,
+    congestion_levels_from_scores,
+)
 
 MPH_TO_KMH = 1.60934
 INCH_TO_MM = 25.4
@@ -1321,51 +1326,6 @@ class CaltransTrafficService:
         span = max(float(median - lower), 1e-6)
         return _clip01((float(median) - float(value)) / span)
 
-    def _congestion_probability(
-        self,
-        *,
-        flow: float,
-        occupancy: float,
-        speed: float,
-        flow_med: float,
-        occ_med: float,
-        speed_med: float,
-        occ_score: float,
-        flow_score: float,
-        speed_score: float,
-        pressure_score: float,
-    ) -> float:
-        occ_pct = float(occupancy) * 100.0
-        occ_med_pct = float(occ_med) * 100.0
-        speed_abs = _clip01((55.0 - float(speed)) / 20.0)
-        occ_abs = _clip01((occ_pct - 8.0) / 14.0)
-        flow_abs = _clip01((float(flow) - float(flow_med)) / max(float(flow_med) * 0.45, 12.0))
-        occ_delta = _clip01((occ_pct - occ_med_pct) / max(8.0, occ_med_pct * 0.6))
-        speed_delta = _clip01((float(speed_med) - float(speed)) / max(12.0, float(speed_med) * 0.25))
-
-        z = (
-            -2.2
-            + 1.9 * speed_abs
-            + 1.6 * occ_abs
-            + 1.3 * occ_score
-            + 1.0 * speed_score
-            + 0.6 * flow_score
-            + 0.5 * pressure_score
-            + 0.6 * occ_delta
-            + 0.4 * speed_delta
-            + 0.2 * flow_abs
-        )
-
-        if speed <= 45.0 and occ_pct >= 12.0:
-            z += 0.7
-        if speed <= 35.0 or occ_pct >= 20.0:
-            z += 0.9
-        if speed >= 62.0 and occ_pct <= 7.0:
-            z -= 0.9
-
-        probability = 1.0 / (1.0 + math.exp(-float(np.clip(z, -8.0, 8.0))))
-        return float(np.clip(probability, 0.0, 1.0))
-
     def _risk_from_state(self, *, sensor: int, idx: int, flow: float, occupancy: float, speed: float) -> dict:
         day_type = self._day_type_index(idx)
         slot = self._slot_index(idx)
@@ -1375,57 +1335,41 @@ class CaltransTrafficService:
         occ_q90 = float(self.profiles["occupancy"]["q90"][day_type, slot, sensor])
         speed_med = float(self.profiles["speed"]["median"][day_type, slot, sensor])
         speed_q10 = float(self.profiles["speed"]["q10"][day_type, slot, sensor])
+        speed_q90 = float(self.profiles["speed"]["q90"][day_type, slot, sensor])
 
-        occ_score = self._normalize_signal(occupancy, occ_med, occ_q90)
-        flow_score = self._normalize_signal(flow, flow_med, flow_q90)
-        speed_score = self._normalize_inverse_signal(speed, speed_med, speed_q10)
-        pressure = float(flow / max(speed, 5.0))
-        pressure_base = float(flow_med / max(speed_med, 5.0))
-        pressure_score = _clip01((pressure - pressure_base) / max(pressure_base, 1e-6))
-
-        combined = 0.50 * occ_score + 0.20 * flow_score + 0.20 * speed_score + 0.10 * pressure_score
-        if speed_score < 0.15 and flow_score < 0.15:
-            combined *= 0.55
-        if occ_score < 0.2 and speed_score < 0.2:
-            combined *= 0.5
-
-        score = float(np.clip(combined, 0.0, 1.0))
-        probability = self._congestion_probability(
+        degree = calculate_congestion_degree(
             flow=flow,
             occupancy=occupancy,
             speed=speed,
             flow_med=flow_med,
+            flow_q90=flow_q90,
             occ_med=occ_med,
+            occ_q90=occ_q90,
             speed_med=speed_med,
-            occ_score=occ_score,
-            flow_score=flow_score,
-            speed_score=speed_score,
-            pressure_score=pressure_score,
+            speed_q10=speed_q10,
+            speed_q90=speed_q90,
         )
-        if score >= 0.8:
-            level = "severe"
-        elif score >= 0.6:
-            level = "high"
-        elif score >= 0.35:
-            level = "medium"
-        else:
-            level = "low"
+        score = float(np.asarray(degree["score"]).item())
+        level = congestion_level_from_score(score)
 
         return {
             "score": score,
-            "probability": probability,
+            "probability": score,
             "level": level,
             "components": {
-                "occupancy": float(occ_score),
-                "flow": float(flow_score),
-                "speed": float(speed_score),
-                "pressure": float(pressure_score),
+                "occupancy": float(np.asarray(degree["occupancy"]).item()),
+                "flow": float(np.asarray(degree["flow"]).item()),
+                "speed": float(np.asarray(degree["speed"]).item()),
+                "pressure": float(np.asarray(degree["pressure"]).item()),
+                "demand": float(np.asarray(degree["demand"]).item()),
             },
             "baseline": {
                 "flow": flow_med,
                 "occupancy": occ_med,
                 "speed": speed_med,
+                "reference_speed": float(np.asarray(degree["reference_speed"]).item()),
             },
+            "algorithm": "congestion_degree_v2",
         }
 
     def _risk_from_arrays(
@@ -1447,25 +1391,22 @@ class CaltransTrafficService:
             occ_q90 = self.profiles["occupancy"]["q90"][day_type, slot]
             speed_med = self.profiles["speed"]["median"][day_type, slot]
             speed_q10 = self.profiles["speed"]["q10"][day_type, slot]
+            speed_q90 = self.profiles["speed"]["q90"][day_type, slot]
 
-            occ_score = np.clip((occupancy[i] - occ_med) / np.maximum(occ_q90 - occ_med, 1e-6), 0.0, 1.0)
-            flow_score = np.clip((flow[i] - flow_med) / np.maximum(flow_q90 - flow_med, 1e-6), 0.0, 1.0)
-            speed_score = np.clip((speed_med - speed[i]) / np.maximum(speed_med - speed_q10, 1e-6), 0.0, 1.0)
-            pressure = flow[i] / np.maximum(speed[i], 5.0)
-            pressure_base = flow_med / np.maximum(speed_med, 5.0)
-            pressure_score = np.clip((pressure - pressure_base) / np.maximum(pressure_base, 1e-6), 0.0, 1.0)
-
-            combined = 0.50 * occ_score + 0.20 * flow_score + 0.20 * speed_score + 0.10 * pressure_score
-            combined[(speed_score < 0.15) & (flow_score < 0.15)] *= 0.55
-            combined[(occ_score < 0.2) & (speed_score < 0.2)] *= 0.5
-            combined = np.clip(combined, 0.0, 1.0)
-            scores[i] = combined.astype(np.float32)
-
-            lv = np.zeros(self.n_nodes, dtype=np.int32)
-            lv[combined >= 0.35] = 1
-            lv[combined >= 0.60] = 2
-            lv[combined >= 0.80] = 3
-            levels[i] = lv
+            degree = calculate_congestion_degree(
+                flow=flow[i],
+                occupancy=occupancy[i],
+                speed=speed[i],
+                flow_med=flow_med,
+                flow_q90=flow_q90,
+                occ_med=occ_med,
+                occ_q90=occ_q90,
+                speed_med=speed_med,
+                speed_q10=speed_q10,
+                speed_q90=speed_q90,
+            )["score"]
+            scores[i] = degree.astype(np.float32)
+            levels[i] = congestion_levels_from_scores(degree)
         return scores, levels
 
     def _window_packet(
@@ -1687,69 +1628,6 @@ class CaltransTrafficService:
             "weather_transition": transition,
         }
 
-    def _build_confidence(self, *, current_risk: dict, windows: dict[str, dict], station_idx: int) -> dict:
-        h1 = windows["h1"]
-        h6 = windows["h6"]
-        h12 = windows["h12"]
-        scores = np.asarray(
-            [
-                current_risk["score"],
-                float(h1["congestion_score"]),
-                float(h6["congestion_score"]),
-                float(h12["congestion_score"]),
-            ],
-            dtype=np.float32,
-        )
-        stability = _clip01(1.0 - float(np.std(scores)) / 0.25)
-        signal_strength = _clip01(float(np.max(scores)))
-        agreement = _clip01(
-            (
-                float(h12["components"]["occupancy"])
-                + float(h12["components"]["speed"])
-                + max(float(h12["components"]["flow"]), float(h12["components"]["pressure"]))
-            )
-            / 3.0
-        )
-        data_score = _clip01(float(self.metadata.iloc[station_idx].get("coverage_ratio", 0.95)))
-        horizon_bonus = _clip01(
-            0.45 * float(h1["congestion_score"]) + 0.55 * max(float(h6["congestion_score"]), float(h12["congestion_score"]))
-        )
-
-        confidence = 0.30 * signal_strength + 0.25 * agreement + 0.25 * stability + 0.10 * data_score + 0.10 * horizon_bonus
-        score = int(round(confidence * 100))
-        label = "high" if score >= 72 else "medium" if score >= 48 else "low"
-
-        reasons = []
-        if float(h12["components"]["occupancy"]) >= 0.55:
-            reasons.append("占有率已明显高于该时段常态。")
-        if float(h12["components"]["speed"]) >= 0.45:
-            reasons.append("车速较该时段历史中位显著下降。")
-        if max(float(h12["components"]["flow"]), float(h12["components"]["pressure"])) >= 0.4:
-            reasons.append("车流和流量/车速压力共同支持拥堵判断。")
-        if stability >= 0.6:
-            reasons.append("5/30/60 分钟风险走势较一致。")
-        if not reasons:
-            reasons.append("当前风险信号偏弱，结论更多依赖模型趋势而非强证据共振。")
-
-        peak_key = max(windows, key=lambda k: float(windows[k]["congestion_score"]))
-        summary = (
-            f"当前置信度由占有率、速度回落和多步走势一致性共同决定。"
-            f" 未来最强风险窗口在 {windows[peak_key]['minutes_ahead']} 分钟。"
-        )
-        return {
-            "score": score,
-            "label": label,
-            "summary": summary,
-            "reasons": reasons,
-            "evidence": {
-                "signal_strength": _round(signal_strength, 3),
-                "agreement_score": _round(agreement, 3),
-                "stability_score": _round(stability, 3),
-                "data_score": _round(data_score, 3),
-                "horizon_bonus": _round(horizon_bonus, 3),
-            },
-        }
-
     def forecast(
         self,
         *,
@@ -1873,7 +1751,6 @@ class CaltransTrafficService:
                 "congestion_score": _round(srisk["score"], 3), "congestion_probability": _round(srisk["probability"], 3), "congestion_level": srisk["level"],
             })
 
-        confidence = self._build_confidence(current_risk=current_risk, windows=windows, station_idx=sensor)
         # scenario_predictions already built above
         # incident_scenarios already built above
 
@@ -2126,7 +2003,6 @@ class CaltransTrafficService:
             "history_tail": history_tail,
             "daily_congestion": daily_congestion,
             "weekly_compare": weekly_compare,
-            "confidence": confidence,
             "scenario_predictions": scenario_predictions,
             "incident_scenarios": incident_scenarios,
             "congestion_summary": {

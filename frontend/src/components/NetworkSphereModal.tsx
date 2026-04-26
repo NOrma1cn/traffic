@@ -97,6 +97,7 @@ const MONTH_MAPPING = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 const FINAL_ANGLES = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180];
 const COLLAPSED_ANGLES = Array.from({ length: 12 }, (_, i) => -45 + i * (90 / 11));
 const NETWORK_STRIP_VISIBLE_COUNT = 19;
+const STAR_MAP_UI_SCALE = 0.67;
 const SELECTOR_BASE_WIDTH = 656;
 const SELECTOR_BASE_HEIGHT = 200;
 const WEATHER_ICON_BASE_SIZE = 76;
@@ -887,8 +888,8 @@ function buildScene(
   for (let i = 0; i < nations.length; i++) {
       const n = nations[i];
       const areaRatio = Math.sqrt(n.childSensors.length / maxRegionSensorCount);
-      const congestionLabelScale = THREE.MathUtils.lerp(0.42, 0.78, areaRatio);
-      const segmentLabelScale = THREE.MathUtils.lerp(0.46, 0.92, areaRatio);
+      const congestionLabelScale = THREE.MathUtils.lerp(0.42, 0.78, areaRatio) * STAR_MAP_UI_SCALE;
+      const segmentLabelScale = THREE.MathUtils.lerp(0.46, 0.92, areaRatio) * STAR_MAP_UI_SCALE;
       
       const geo = new THREE.PlaneGeometry(1, 1);
       
@@ -1270,7 +1271,9 @@ function buildScene(
   };
   updateNodes(); // initial
   setPulseOrigin(activeFocusSensor);
-  pulseElapsed = 0; // 从0开始，让脉冲可见
+  pulseElapsed = latestProps.current.compactOrb
+    ? pulseTravelDuration + pulseRiseDuration + pulseHoldDuration + pulseFadeDuration + 1
+    : 0;
 
   /* ── Raycaster Click Logic ── */
   const raycaster = new THREE.Raycaster();
@@ -1435,6 +1438,7 @@ function buildScene(
     const dt = Math.min(0.05, (now - lastFrame) / 1000);
     lastFrame = now;
     elapsed += dt;
+    const compactOrbActive = latestProps.current.compactOrb ?? false;
 
     fpsFrames += 1;
     if (onFpsUpdate && now - fpsLastSampleAt >= 250) {
@@ -1452,7 +1456,9 @@ function buildScene(
       1,
     );
     controls.rotateSpeed = THREE.MathUtils.lerp(MIN_ROTATE_SPEED, MAX_ROTATE_SPEED, zoomFactor);
-    controls.update();
+    if (!compactOrbActive) {
+      controls.update();
+    }
     const dist = camera.position.length();
     
     // 第一帧立即报告初始缩放级别，避免UI突变
@@ -1552,9 +1558,13 @@ function buildScene(
     }
 
     // ── Polygon Face State ──
-    pulseElapsed += dt;
     const pulseTotalDuration = pulseTravelDuration + pulseRiseDuration + pulseHoldDuration + pulseFadeDuration;
-    const pulseActive = pulseElapsed <= pulseTotalDuration;
+    if (compactOrbActive) {
+      pulseElapsed = pulseTotalDuration + 1;
+    } else {
+      pulseElapsed += dt;
+    }
+    const pulseActive = !compactOrbActive && pulseElapsed <= pulseTotalDuration;
     if (congestionTransitionActive) {
       congestionTransitionElapsed += dt;
       let transitionDone = true;
@@ -1700,16 +1710,23 @@ function buildScene(
     for (let i = 0; i < sensorCount; i++) {
        const p = sensorPositions[i];
        nodeNormal.copy(p).normalize();
-       nodeCurrentScales[i] = THREE.MathUtils.lerp(nodeCurrentScales[i], nodeTargetScales[i], 0.16);
-       nodeCurrentColors[i].lerp(nodeTargetColors[i], 0.16);
+       if (compactOrbActive) {
+         nodeCurrentScales[i] = nodeTargetScales[i];
+         nodeCurrentColors[i].copy(nodeTargetColors[i]);
+       } else {
+         nodeCurrentScales[i] = THREE.MathUtils.lerp(nodeCurrentScales[i], nodeTargetScales[i], 0.16);
+         nodeCurrentColors[i].lerp(nodeTargetColors[i], 0.16);
+       }
 
        const isHighlighted = i === (latestProps.current.highlightedSensor ?? -1);
        const isTargeted = i === latestProps.current.selectedSensor;
        const isHoveredNode = i === hoveredSensor;
-       const pulse = isHighlighted
-         ? 1.0 + Math.sin(elapsed * 5.2) * 0.12
-         : isTargeted
-          ? 1.0 + Math.sin(elapsed * 4.5) * 0.08
+       const pulse = compactOrbActive
+         ? 1.0
+         : isHighlighted
+          ? 1.0 + Math.sin(elapsed * 5.2) * 0.12
+          : isTargeted
+           ? 1.0 + Math.sin(elapsed * 4.5) * 0.08
           : isHoveredNode
             ? 1.0 + Math.sin(elapsed * 7.0) * 0.06
            : 1.0;
@@ -1732,7 +1749,7 @@ function buildScene(
       const norm = p.clone().normalize();
       focusRingMesh.position.copy(p).addScaledVector(norm, 0.008);
       focusRingMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), norm);
-      const focusPulse = 1.0 + Math.sin(elapsed * 5.2) * 0.12;
+      const focusPulse = compactOrbActive ? 1.0 : 1.0 + Math.sin(elapsed * 5.2) * 0.12;
       const focusScale = Math.max(nodeCurrentScales[activeHighlightIdx], 0.05) * focusPulse;
       focusRingMesh.scale.setScalar(focusScale);
       focusRingMesh.visible = true;
@@ -2667,7 +2684,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
   const visibleDayCount = getDaysInMonth(widgetMonth);
   const overlayViewport = useOverlayViewport(isOpen && !compactOrb);
   const overlayInset = clampNumber(Math.round(Math.min(28, Math.max(12, Math.min(overlayViewport.width, overlayViewport.height) * 0.03))), 12, 28);
-  const selectorScale = clampNumber(
+  const selectorResponsiveScale = clampNumber(
     Math.min(
       (overlayViewport.width - overlayInset * 2) / SELECTOR_BASE_WIDTH,
       (overlayViewport.height - overlayInset * 2) / 520,
@@ -2676,8 +2693,9 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
     0.48,
     1,
   );
+  const selectorScale = selectorResponsiveScale * STAR_MAP_UI_SCALE;
   const selectorGap = clampNumber(Math.round(overlayViewport.width * 0.024), 10, 32);
-  const weatherScale = clampNumber(Math.min(overlayViewport.width / 720, overlayViewport.height / 560), 0.68, 1);
+  const weatherScale = clampNumber(Math.min(overlayViewport.width / 720, overlayViewport.height / 560), 0.68, 1) * STAR_MAP_UI_SCALE;
   const weatherBottom = overlayViewport.width < 760
     ? overlayInset + SELECTOR_BASE_HEIGHT * selectorScale + 12
     : overlayInset;
@@ -2785,6 +2803,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
                   viewport={overlayViewport}
                   inset={overlayInset}
                   maxHeight={topOverlayAvailableHeight}
+                  uiScale={STAR_MAP_UI_SCALE}
                 />
 
                 <NetworkRelationStripOverlay
@@ -2795,6 +2814,7 @@ export const NetworkSphereModal: React.FC<NetworkSphereModalProps> = ({
                   viewport={overlayViewport}
                   inset={overlayInset}
                   maxHeight={topOverlayAvailableHeight}
+                  uiScale={STAR_MAP_UI_SCALE}
                 />
 
                 <WeatherStatusOverlay
@@ -3093,7 +3113,8 @@ const NetworkRelationStripOverlay: React.FC<{
   viewport: OverlayViewport;
   inset: number;
   maxHeight: number;
-}> = ({ data, zoom, visible, onSensorClick, viewport, inset, maxHeight }) => {
+  uiScale: number;
+}> = ({ data, zoom, visible, onSensorClick, viewport, inset, maxHeight, uiScale }) => {
   const cameraDistance = MAX_CAMERA_DISTANCE - zoom * (MAX_CAMERA_DISTANCE - MIN_CAMERA_DISTANCE);
   const zoomOpacity = Math.max(0, Math.min(1, (cameraDistance - 4.5) / 2.0)) * 0.9;
   const opacity = visible && data ? zoomOpacity : 0;
@@ -3135,7 +3156,14 @@ const NetworkRelationStripOverlay: React.FC<{
       onTouchMove={(event) => event.stopPropagation()}
       aria-hidden={opacity <= 0.01}
     >
-      <div className="flex items-start" style={{ gap }}>
+      <div
+        className="flex items-start"
+        style={{
+          gap,
+          transform: `scale(${uiScale})`,
+          transformOrigin: 'top left',
+        }}
+      >
         <div
           className="flex flex-col rounded-[2px] bg-white/[0.03] p-[3px] shadow-[0_24px_80px_rgba(0,0,0,0.42)] ring-1 ring-white/10 backdrop-blur-md"
           onPointerDown={(event) => event.stopPropagation()}
@@ -3237,7 +3265,8 @@ const SegmentLeaderboardOverlay: React.FC<{
   viewport: OverlayViewport;
   inset: number;
   maxHeight: number;
-}> = ({ items, zoom, visible, viewport, inset, maxHeight }) => {
+  uiScale: number;
+}> = ({ items, zoom, visible, viewport, inset, maxHeight, uiScale }) => {
   const compact = viewport.width < 720;
   const rowHeight = compact ? 46 : 58;
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -3273,71 +3302,78 @@ const SegmentLeaderboardOverlay: React.FC<{
       }}
       aria-hidden={!interactive}
     >
-      <div className="flex items-end" style={{ gap: titleGap, marginBottom: titleMarginBottom }}>
-        <div className={`${compact ? 'text-[9px]' : 'text-[10px]'} font-black uppercase tracking-[0.32em] text-white/35`}>Segment Load</div>
-        <div className="h-px flex-1 bg-gradient-to-r from-white/25 to-transparent" />
-      </div>
-
       <div
-        ref={scrollRef}
-        className="overflow-y-auto [scrollbar-width:none] [-ms-overflow-style:none]"
-        onScroll={handleLeaderboardScroll}
-        onWheel={(event) => event.stopPropagation()}
-        onPointerDown={(event) => event.stopPropagation()}
-        onTouchMove={(event) => event.stopPropagation()}
         style={{
-          WebkitOverflowScrolling: 'touch',
-          scrollSnapType: 'y mandatory',
-          maxHeight: listMaxHeight,
-          paddingRight: compact ? 8 : 20,
+          transform: `scale(${uiScale})`,
+          transformOrigin: 'top left',
         }}
       >
-        <div className="flex flex-col pb-6 [&::-webkit-scrollbar]:hidden">
-          {items.map((item, index) => {
-            const visualIndex = index - headIndex;
-            const isTop = visualIndex === 0;
-            const isAboveHead = visualIndex < 0;
-            const scale = isAboveHead ? 0.7 : Math.max(0.68, 1 - visualIndex * 0.06);
-            const rowOpacity = isAboveHead ? 0 : Math.max(0.26, 1 - visualIndex * 0.1);
+        <div className="flex items-end" style={{ gap: titleGap, marginBottom: titleMarginBottom }}>
+          <div className={`${compact ? 'text-[9px]' : 'text-[10px]'} font-black uppercase tracking-[0.32em] text-white/35`}>Segment Load</div>
+          <div className="h-px flex-1 bg-gradient-to-r from-white/25 to-transparent" />
+        </div>
 
-            return (
-              <button
-                key={item.nationIdx}
-                type="button"
-                className="group grid w-full items-baseline text-left outline-none transition-[opacity,transform] duration-200 ease-out"
-                style={{
-                  height: rowHeight,
-                  gridTemplateColumns: compact
-                    ? '26px minmax(0, 1fr) 58px'
-                    : '34px minmax(0, 1fr) 74px',
-                  gap: compact ? 10 : 16,
-                  transform: `scale(${scale})`,
-                  transformOrigin: 'left center',
-                  opacity: rowOpacity,
-                  pointerEvents: isAboveHead ? 'none' : 'auto',
-                  visibility: isAboveHead ? 'hidden' : 'visible',
-                  scrollSnapAlign: 'start',
-                  scrollSnapStop: 'always',
-                }}
-              >
-                <span
-                  className={`${compact ? 'text-[15px]' : 'text-[18px]'} font-black tabular-nums ${isTop ? 'text-white' : 'text-white/35'}`}
+        <div
+          ref={scrollRef}
+          className="overflow-y-auto [scrollbar-width:none] [-ms-overflow-style:none]"
+          onScroll={handleLeaderboardScroll}
+          onWheel={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+          onTouchMove={(event) => event.stopPropagation()}
+          style={{
+            WebkitOverflowScrolling: 'touch',
+            scrollSnapType: 'y mandatory',
+            maxHeight: listMaxHeight,
+            paddingRight: compact ? 8 : 20,
+          }}
+        >
+          <div className="flex flex-col pb-6 [&::-webkit-scrollbar]:hidden">
+            {items.map((item, index) => {
+              const visualIndex = index - headIndex;
+              const isTop = visualIndex === 0;
+              const isAboveHead = visualIndex < 0;
+              const scale = isAboveHead ? 0.7 : Math.max(0.68, 1 - visualIndex * 0.06);
+              const rowOpacity = isAboveHead ? 0 : Math.max(0.26, 1 - visualIndex * 0.1);
+
+              return (
+                <button
+                  key={item.nationIdx}
+                  type="button"
+                  className="group grid w-full items-baseline text-left outline-none transition-[opacity,transform] duration-200 ease-out"
+                  style={{
+                    height: rowHeight,
+                    gridTemplateColumns: compact
+                      ? '26px minmax(0, 1fr) 58px'
+                      : '34px minmax(0, 1fr) 74px',
+                    gap: compact ? 10 : 16,
+                    transform: `scale(${scale})`,
+                    transformOrigin: 'left center',
+                    opacity: rowOpacity,
+                    pointerEvents: isAboveHead ? 'none' : 'auto',
+                    visibility: isAboveHead ? 'hidden' : 'visible',
+                    scrollSnapAlign: 'start',
+                    scrollSnapStop: 'always',
+                  }}
                 >
-                  {index + 1}
-                </span>
-                <span
-                  className={`truncate ${compact ? 'text-[clamp(20px,7vw,30px)]' : 'text-[clamp(24px,3vw,42px)]'} font-black leading-[1.04] tracking-[-0.04em] transition-colors duration-200 group-hover:text-white ${isTop ? 'text-white drop-shadow-[0_8px_28px_rgba(255,255,255,0.18)]' : 'text-white/40'}`}
-                >
-                  {item.label}
-                </span>
-                <span
-                  className={`text-right ${compact ? 'text-[18px]' : 'text-[22px]'} font-black tabular-nums ${isTop ? 'text-white' : 'text-white/40'}`}
-                >
-                  {item.percent}%
-                </span>
-              </button>
-            );
-          })}
+                  <span
+                    className={`${compact ? 'text-[15px]' : 'text-[18px]'} font-black tabular-nums ${isTop ? 'text-white' : 'text-white/35'}`}
+                  >
+                    {index + 1}
+                  </span>
+                  <span
+                    className={`truncate ${compact ? 'text-[clamp(20px,7vw,30px)]' : 'text-[clamp(24px,3vw,42px)]'} font-black leading-[1.04] tracking-[-0.04em] transition-colors duration-200 group-hover:text-white ${isTop ? 'text-white drop-shadow-[0_8px_28px_rgba(255,255,255,0.18)]' : 'text-white/40'}`}
+                  >
+                    {item.label}
+                  </span>
+                  <span
+                    className={`text-right ${compact ? 'text-[18px]' : 'text-[22px]'} font-black tabular-nums ${isTop ? 'text-white' : 'text-white/40'}`}
+                  >
+                    {item.percent}%
+                  </span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
     </motion.aside>

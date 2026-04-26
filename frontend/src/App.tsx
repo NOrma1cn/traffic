@@ -22,9 +22,8 @@ import RiskDashboardHUD from './components/RiskDashboardHUD';
 import HUDContainer from './components/HUDContainer';
 import { type IncidentContext, type IncidentScenario } from './components/IncidentStatusPanel';
 import WeatherTopologyRing, { type WeatherRingMetric } from './components/WeatherTopologyRing';
-import { deriveWeatherVisual } from './weather';
+import { deriveWeatherVisual, type WeatherSnapshot } from './weather';
 import { useDesignViewport } from './hooks/useDesignViewport';
-import V2BlankPage from './pages/V2BlankPage';
 
 const DEFAULT_POLL_MS = import.meta.env.DEV ? 3_000 : 300_000;
 const POLL_MS = Number(import.meta.env.VITE_POLL_MS ?? DEFAULT_POLL_MS);
@@ -402,17 +401,16 @@ const levelLabel = (level: string) => {
   }
 };
 
-type AppView = 'v1' | 'v2';
-
-const V2_HASH = '#/v2';
-
-const getAppView = (): AppView => {
-  if (typeof window === 'undefined') return 'v1';
-  return window.location.hash === V2_HASH ? 'v2' : 'v1';
+const getInitialQueryNumber = (key: string) => {
+  if (typeof window === 'undefined') return null;
+  const raw = new URLSearchParams(window.location.search).get(key);
+  if (raw === null || raw.trim() === '') return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
 };
 
 const DashboardV1Page: React.FC = () => {
-  const [sensor, setSensor] = useState<number>(42);
+  const [sensor, setSensor] = useState<number>(() => Math.max(0, Math.floor(getInitialQueryNumber('sensor') ?? 42)));
   const [nSensors, setNSensors] = useState<number>(743);
   const [apiBase, setApiBase] = useState<string>(ENV_API_BASE);
   const [api, setApi] = useState<ApiResponse | null>(null);
@@ -438,7 +436,10 @@ const DashboardV1Page: React.FC = () => {
   const [spherePreview, setSpherePreview] = useState<{ sensor: number; tObs: number } | null>(null);
   const [spherePreviewApi, setSpherePreviewApi] = useState<ApiResponse | null>(null);
   const [sphereDateSelection, setSphereDateSelection] = useState<{ month: number; day: number } | null>(null);
-  const [selectedTObsOverride, setSelectedTObsOverride] = useState<number | null>(null);
+  const [selectedTObsOverride, setSelectedTObsOverride] = useState<number | null>(() => {
+    const initialTObs = getInitialQueryNumber('t_obs');
+    return initialTObs === null ? null : Math.max(0, Math.floor(initialTObs));
+  });
   const [backgroundLedMode, setBackgroundLedMode] = useState(false);
   const designViewport = useDesignViewport(viewport.w, viewport.h, DESIGN_WIDTH, DESIGN_HEIGHT);
 
@@ -448,7 +449,7 @@ const DashboardV1Page: React.FC = () => {
   const loadingRef = useRef<boolean>(false);
   const mainRequestKeyRef = useRef<string | null>(null);
   const spherePreviewRequestKeyRef = useRef<string | null>(null);
-  const selectedTObsOverrideRef = useRef<number | null>(null);
+  const selectedTObsOverrideRef = useRef<number | null>(selectedTObsOverride);
   const datasetTimeStepCount = Math.max(1, Math.floor(api?.dataset_context?.time_steps ?? 1));
 
   const setManualTObsOverride = (value: number | null) => {
@@ -506,6 +507,38 @@ const DashboardV1Page: React.FC = () => {
       default:
         return baseline;
     }
+  };
+
+  const presetConditionForVisual = (preset: WeatherPresetKey): string => {
+    switch (preset) {
+      case 'clear':
+        return 'Sunny';
+      case 'cloudy':
+        return 'Overcast';
+      case 'storm':
+        return 'Stormy';
+      case 'fog':
+        return 'Foggy';
+      default:
+        return 'Rainy';
+    }
+  };
+
+  const buildVisualWeatherSnapshot = (
+    base: WeatherPacket | null | undefined,
+    override: WeatherOverride | null,
+    preset: WeatherPresetKey,
+  ): WeatherSnapshot | null | undefined => {
+    if (!override) return base;
+    return {
+      condition: presetConditionForVisual(preset),
+      precipitation_pct: override.precip !== undefined
+        ? Math.round(clamp01(override.precip / 0.2) * 100)
+        : base?.precipitation_pct,
+      cloudcover: override.cloudcover ?? base?.cloudcover,
+      humidity: override.humidity ?? base?.humidity,
+      wind_kmh: override.windspeed !== undefined ? override.windspeed * KMH_PER_MPH : base?.wind_kmh,
+    };
   };
 
   const activeWeatherOverride = useMemo<WeatherOverride | null>(() => {
@@ -631,7 +664,9 @@ const DashboardV1Page: React.FC = () => {
         for (const base of candidates) {
           try {
             await checkHealthAt(base);
-            await fetchForecastOnce(sensor, base);
+            await fetchForecastOnce(sensor, base, {
+              tObs: selectedTObsOverrideRef.current ?? undefined,
+            });
             if (base !== apiBase) setApiBase(base);
             setBootPhase('transition');
             return;
@@ -669,14 +704,14 @@ const DashboardV1Page: React.FC = () => {
   }, [apiBase, bootPhase]);
 
   useEffect(() => {
-    if (bootPhase !== 'ready' || isSphereOpen) return;
+    if (bootPhase !== 'ready') return;
     fetchForecastOnce(sensor, undefined, {
       tObs: selectedTObsOverrideRef.current ?? undefined,
     }).catch(() => {});
-  }, [sensor, bootPhase, apiBase, isSphereOpen, selectedTObsOverride]);
+  }, [sensor, bootPhase, apiBase, selectedTObsOverride]);
 
   useEffect(() => {
-    if (bootPhase !== 'ready' || isSphereOpen) return;
+    if (bootPhase !== 'ready') return;
     let cancelled = false;
     const loop = async () => {
       while (!cancelled) {
@@ -691,7 +726,7 @@ const DashboardV1Page: React.FC = () => {
     };
     loop();
     return () => { cancelled = true; };
-  }, [bootPhase, apiBase, sensor, isSphereOpen, selectedTObsOverride]);
+  }, [bootPhase, apiBase, sensor, selectedTObsOverride]);
 
   useEffect(() => {
     if (bootPhase !== 'ready' || !api || !weatherOverrideEnabled || !activeWeatherOverride) {
@@ -800,7 +835,8 @@ const DashboardV1Page: React.FC = () => {
   const uiVisible = bootPhase === 'ready';
   const isBackgroundActive = !isSphereOpen;
   const dashboardChromeVisible = uiVisible && !isSphereOpen && !sphereTransitioning;
-  const weatherVisual = deriveWeatherVisual(api?.current_weather);
+  const visualWeather = buildVisualWeatherSnapshot(api?.current_weather, activeWeatherOverride, weatherPreset);
+  const weatherVisual = deriveWeatherVisual(visualWeather);
   const sphereWeather = (isSphereOpen ? spherePreviewApi?.current_weather : undefined) ?? api?.current_weather;
   const sphereWeatherVisual = deriveWeatherVisual(sphereWeather);
   const congestionWarningLevel = api?.congestion_summary?.peak_level === 'severe' || api?.congestion_summary?.peak_level === 'high' ? 'high' : api?.congestion_summary?.peak_level === 'medium' ? 'medium' : 'low';
@@ -816,7 +852,6 @@ const DashboardV1Page: React.FC = () => {
       return 'midnight';
     } catch { return 'noon'; }
   }, [api?.meta?.sim_time]);
-
   const chartConfigs = useMemo(() => {
     if (!api) return {};
     const metrics: MetricKey[] = ['risk', 'speed', 'flow', 'occupancy'];
@@ -956,6 +991,16 @@ const DashboardV1Page: React.FC = () => {
     setWeatherOverrideEnabled((prev) => !prev);
   };
 
+  const toggleBackgroundLedMode = () => {
+    if (backgroundLedMode) {
+      setBackgroundLedMode(false);
+      setWeatherOverrideEnabled(false);
+      return;
+    }
+
+    setBackgroundLedMode(true);
+  };
+
   const cycleWeatherPreset = (direction: 1 | -1) => {
     setWeatherOverrideEnabled(true);
     setWeatherPreset((prev) => {
@@ -1022,12 +1067,12 @@ const DashboardV1Page: React.FC = () => {
         if (isSphereOpen || e.defaultPrevented) return;
         if (bootPhase !== 'ready') return;
         e.preventDefault();
-        setBackgroundLedMode((prev) => !prev);
+        toggleBackgroundLedMode();
       }}
     >
       <BackgroundShader
         weatherCondition={weatherVisual.shaderCondition}
-        precipitation={api?.current_weather?.precipitation_pct ?? 0}
+        precipitation={visualWeather?.precipitation_pct ?? 0}
         dayPhase={dayPhase}
         ledMode={backgroundLedMode}
         isActive={isBackgroundActive}
@@ -1314,19 +1359,6 @@ const DashboardV1Page: React.FC = () => {
 };
 
 const App: React.FC = () => {
-  const [appView, setAppView] = useState<AppView>(() => getAppView());
-
-  useEffect(() => {
-    const syncAppView = () => setAppView(getAppView());
-
-    window.addEventListener('hashchange', syncAppView);
-    return () => window.removeEventListener('hashchange', syncAppView);
-  }, []);
-
-  if (appView === 'v2') {
-    return <V2BlankPage />;
-  }
-
   return <DashboardV1Page />;
 };
 
